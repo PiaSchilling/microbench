@@ -1,14 +1,16 @@
-// gemm.cpp -- naive Matrixmultiplikation C = A * B (Proxy-Kernel GEMM)
+// gemm.cpp -- Matrixmultiplikation C = A * B (Proxy-Kernel GEMM), geblockt oder naiv
 //
 // Bauen:   hipcc -O3 -std=c++17 --offload-arch=gfx942 gemm.cpp -o gemm
-// Starten: ./gemm --duration 30 --precision fp64 --size 4096
-//          ./gemm --duration 30 --precision fp16_acc32 --m 8192 --n 8192 --k 512
+// Starten: ./gemm --duration 30 --precision fp64 --m 8192 --n 8192 --k 256
+//          ./gemm --duration 30 --precision fp32 --size 4096 --kernel naive
 //
 // Argumente (alle optional):
-//   --duration <s>       Ziel-Laufzeit der Zeitschleife                  (30)
-//   --precision <p>      Datentypen, siehe Tabelle                       (fp64)
-//   --size <n>           setzt M = N = K = n                             (4096)
+//   --duration <s>       Ziel-Laufzeit der Zeitschleife                       (30)
+//   --kernel <k>         blocked | naive                                      (blocked)
+//   --precision <p>      Datentypen, siehe Tabelle                            (fp64)
+//   --size <n>           setzt M = N = K = n                                  (4096)
 //   --m / --n / --k <n>  einzelne Dimensionen, C[MxN] = A[MxK] * B[KxN]
+//                        blocked: M und N muessen Vielfache von 128 sein, K ist beliebig
 //
 //   precision    Eingabe   Akkumulation   Ausgabe
 //   fp64         fp64      fp64           fp64
@@ -20,8 +22,25 @@
 //   int32        int32     int32          int32
 //   int64        int64     int64          int64
 //
-// Ein Thread pro Element von C, row-major, ohne Tiling oder LDS. Ueber die Form (M, N, K)
-// laesst sich die arithmetische Intensitaet variieren.
+// --kernel blocked (Standard): Jede Workgroup (256 Threads) berechnet eine TILE x TILE-Kachel von C. Sie laedt
+// dafuer ihren Zeilenstreifen von A (TILE x K) und Spaltenstreifen von B (K x TILE) in
+// Stuecken von je einer Cache-Line Tiefe ins LDS, jeder Thread akkumuliert RT x RT Elemente in
+// Registern. Jedes geladene Element wird so TILE-mal wiederverwendet. Keine Matrix Cores.
+//
+// Verkehrsmodell "kernel_level" (exakt das, was der Kernel aus dem globalen Speicher laedt/schreibt):
+//   Bytes = s_in * (M*K * N/TILE + K*N * M/TILE) + s_out * M*N
+//   Flop  = 2 * M*N*K
+//   AI    = 2K / (s_in * 2K/TILE + s_out)          (unabhaengig von M und N)
+//   fp64:  AI = 16 K / (K + 64)   -> K steuert die AI von ~0.25 (K=1) bis gegen 16
+// Jede geladene Cache-Line wird voll genutzt, sofern K <= 128/s_in oder K ein Vielfaches
+// davon ist (sonst liegen die Zeilen von A nicht auf Line-Grenzen). Das Modell entspricht damit dem Verkehr
+// zwischen Kernel und L1/L2. Der HBM-Verkehr kann niedriger sein, wenn sich Workgroups
+// Streifen von A/B ueber L2 oder Infinity Cache teilen.
+//
+// --kernel naive: Ein Thread pro Element von C, ohne Kacheln und LDS. Jeder Thread liest seine
+// ganze Zeile von A und Spalte von B, die Wiederverwendung haengt allein von den Caches ab.
+// Verkehrsmodell "minimal": A, B und C je genau einmal. Das ist eine Untergrenze fuer den
+// echten Verkehr (Obergrenze fuer die AI); der tatsaechliche liegt um Groessenordnungen hoeher.
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -46,11 +65,62 @@
         }                                                                      \
     } while (0)
 
-constexpr int THREADS = 256;
+constexpr int TILE = 128;          // Kachelgroesse von C pro Workgroup (TILE x TILE)
+constexpr int LINE = 128;          // Cache-Line in Byte (MI300A)
+constexpr int TDIM = 16;           // Threads pro Workgroup: TDIM x TDIM
+constexpr int TPB  = TDIM * TDIM;  // = 256
+constexpr int RT   = TILE / TDIM;  // jeder Thread: RT x RT Elemente von C (= 8 x 8)
 
 // T = Eingabetyp (A, B), AccT = Akkumulationstyp, CT = Ausgabetyp (C)
+// KT = Tiefe in K pro LDS-Stueck, so gewaehlt, dass eine Zeile von A pro Stueck genau eine
+// Cache-Line fuellt (fp64: 16, fp32: 32, fp16: 64, int8: 128). LDS-Bedarf: 2*LINE*TILE = 32 KiB.
 template <typename T, typename AccT, typename CT>
-__global__ void matmul(const T* A, const T* B, CT* C, int M, int N, int K) {
+__global__ __launch_bounds__(TPB) void gemm_blocked(const T* A, const T* B, CT* C, int M, int N, int K) {
+    constexpr int KT = LINE / (int)sizeof(T);
+    __shared__ T As[KT][TILE];     // A-Stueck, transponiert abgelegt: As[k][m]
+    __shared__ T Bs[KT][TILE];     // B-Stueck: Bs[k][n]
+
+    const int tid  = threadIdx.x;
+    const int tx   = tid % TDIM;
+    const int ty   = tid / TDIM;
+    const int row0 = blockIdx.y * TILE;
+    const int col0 = blockIdx.x * TILE;
+
+    AccT acc[RT][RT];
+    for (int i = 0; i < RT; ++i)
+        for (int j = 0; j < RT; ++j) acc[i][j] = (AccT)0;
+
+    for (int k0 = 0; k0 < K; k0 += KT) {
+        // Jedes Element des Streifens wird genau einmal geladen; jenseits von K mit 0 auffuellen
+        for (int e = tid; e < TILE * KT; e += TPB) {
+            const int m = e / KT, kk = e % KT, gk = k0 + kk;
+            As[kk][m] = (gk < K) ? A[(size_t)(row0 + m) * K + gk] : (T)0;
+        }
+        for (int e = tid; e < KT * TILE; e += TPB) {
+            const int kk = e / TILE, n = e % TILE, gk = k0 + kk;
+            Bs[kk][n] = (gk < K) ? B[(size_t)gk * N + col0 + n] : (T)0;
+        }
+        __syncthreads();
+
+        const int kmax = (K - k0 < KT) ? (K - k0) : KT;   // kein Rechnen auf Fuellnullen
+        for (int kk = 0; kk < kmax; ++kk) {
+            AccT a[RT], b[RT];
+            for (int i = 0; i < RT; ++i) a[i] = (AccT)As[kk][ty + TDIM * i];
+            for (int j = 0; j < RT; ++j) b[j] = (AccT)Bs[kk][tx + TDIM * j];
+            for (int i = 0; i < RT; ++i)
+                for (int j = 0; j < RT; ++j) acc[i][j] += a[i] * b[j];
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < RT; ++i)
+        for (int j = 0; j < RT; ++j)
+            C[(size_t)(row0 + ty + TDIM * i) * N + col0 + tx + TDIM * j] = (CT)acc[i][j];
+}
+
+// Naiv: ein Thread pro Element von C, row-major
+template <typename T, typename AccT, typename CT>
+__global__ __launch_bounds__(TPB) void gemm_naive(const T* A, const T* B, CT* C, int M, int N, int K) {
     size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= (size_t)M * N) return;
     size_t row = idx / N;
@@ -125,19 +195,20 @@ static void json_num(char* buf, size_t n, double v, const char* fmt) {
 }
 
 template <typename T, typename AccT, typename CT>
-static int run(double duration, int M, int N, int K,
+static int run(double duration, bool naive, int M, int N, int K,
                const char* precision, const char* in_s, const char* acc_s, const char* out_s) {
     constexpr bool is_int = std::is_integral<AccT>::value;
     const char* op_type = is_int ? "iop" : "flop";
     const char* unit    = is_int ? "GIop/s" : "GFlop/s";
 
-    const size_t MN    = (size_t)M * N;
-    const size_t a_el  = (size_t)M * K;
-    const size_t b_el  = (size_t)K * N;
-    const size_t blocks = (MN + THREADS - 1) / THREADS;
-    if (blocks > UINT_MAX) { fprintf(stderr, "M*N too big for the grid\n"); return 1; }
-    fprintf(stderr, "precision=%s M=%d N=%d K=%d blocks=%zu threads=%d\n",
-            precision, M, N, K, blocks, THREADS);
+    const size_t MN   = (size_t)M * N;
+    const size_t a_el = (size_t)M * K;
+    const size_t b_el = (size_t)K * N;
+    const char* kernel = naive ? "naive" : "blocked";
+    const char* model  = naive ? "minimal" : "kernel_level";
+    const dim3 grid = naive ? dim3((unsigned)((MN + TPB - 1) / TPB)) : dim3(N / TILE, M / TILE);
+    fprintf(stderr, "kernel=%s precision=%s M=%d N=%d K=%d grid=%ux%u threads=%d\n",
+            kernel, precision, M, N, K, grid.x, grid.y, TPB);
 
     std::vector<T>  h_A(a_el), h_B(b_el);
     std::vector<CT> h_C(MN);
@@ -154,8 +225,8 @@ static int run(double duration, int M, int N, int K,
     HIP_CHECK(hipMemset(d_C, 0xFF, MN * sizeof(CT)));   // ungeschriebene Elemente fallen auf
 
     auto launch = [&]() {
-        hipLaunchKernelGGL((matmul<T, AccT, CT>), dim3((unsigned)blocks), dim3(THREADS), 0, 0,
-                           d_A, d_B, d_C, M, N, K);
+        if (naive) hipLaunchKernelGGL((gemm_naive<T, AccT, CT>),   grid, dim3(TPB), 0, 0, d_A, d_B, d_C, M, N, K);
+        else       hipLaunchKernelGGL((gemm_blocked<T, AccT, CT>), grid, dim3(TPB), 0, 0, d_A, d_B, d_C, M, N, K);
     };
 
     // Warmup (nicht gezaehlt), danach ein Start zur Kalibrierung: so viele Starts pro
@@ -191,18 +262,20 @@ static int run(double duration, int M, int N, int K,
     if (!ok) fprintf(stderr, "Verifikation fehlgeschlagen: max_rel_err=%.3e > Toleranz %.3e\n",
                      max_rel_err, tol);
 
-    // Analytische Groessen; GB = 10^9 Byte. a_gbyte ist der minimale Verkehr (A, B, C je
-    // einmal). Der naive Kernel liest A und B tatsaechlich mehrfach (ueber Caches).
+    // Analytische Groessen nach dem jeweiligen Verkehrsmodell (siehe oben); GB = 10^9 Byte
     const double flop_per_launch = 2.0 * M * (double)N * K;
-    const double byte_per_launch = (double)(a_el + b_el) * sizeof(T) + (double)MN * sizeof(CT);
+    const double reads_per_launch = naive
+        ? (double)sizeof(T) * ((double)a_el + (double)b_el)                                  // minimal
+        : (double)sizeof(T) * ((double)a_el * (N / TILE) + (double)b_el * (M / TILE));       // kernel_level
+    const double byte_per_launch = reads_per_launch + (double)sizeof(CT) * (double)MN;
     const double a_gflop = (double)launches * flop_per_launch / 1e9;
     const double a_gbyte = (double)launches * byte_per_launch / 1e9;
     const double a_intensity = flop_per_launch / byte_per_launch;
     const double d_gflop_per_s = a_gflop / elapsed;
     const double d_gbyte_per_s = a_gbyte / elapsed;
 
-    fprintf(stderr, "precision=%s M=%d N=%d K=%d  %ld Starts  %.2f s  %.1f %s  max_rel_err=%.2e\n",
-            precision, M, N, K, launches, elapsed, d_gflop_per_s, unit, max_rel_err);
+    fprintf(stderr, "kernel=%s precision=%s M=%d N=%d K=%d  %ld Starts  %.2f s  %.1f %s  AI=%.2f  max_rel_err=%.2e\n",
+            kernel, precision, M, N, K, launches, elapsed, d_gflop_per_s, unit, a_intensity, max_rel_err);
 
     char err_s[32], tol_s[32];
     json_num(err_s, sizeof err_s, max_rel_err, "%.3e");
@@ -210,12 +283,12 @@ static int run(double duration, int M, int N, int K,
     printf("{\"runtime_s\": %.6f, \"iterations\": %ld, "
            "\"a_gflop\": %.6f, \"a_gbyte\": %.6f, \"a_intensity\": %.6f, "
            "\"d_gflop_per_s\": %.3f, \"d_gbyte_per_s\": %.3f, \"verify_ok\": %s, "
-           "\"precision\": \"%s\", \"op_type\": \"%s\", "
+           "\"precision\": \"%s\", \"op_type\": \"%s\", \"kernel\": \"%s\", \"traffic_model\": \"%s\", "
            "\"input_precision\": \"%s\", \"acc_precision\": \"%s\", \"output_precision\": \"%s\", "
-           "\"m\": %d, \"n\": %d, \"k\": %d, \"max_rel_err\": %s, \"tolerance\": %s}\n",
+           "\"m\": %d, \"n\": %d, \"k\": %d, \"tile\": %d, \"max_rel_err\": %s, \"tolerance\": %s}\n",
            elapsed, launches, a_gflop, a_gbyte, a_intensity,
            d_gflop_per_s, d_gbyte_per_s, ok ? "true" : "false",
-           precision, op_type, in_s, acc_s, out_s, M, N, K, err_s, tol_s);
+           precision, op_type, kernel, model, in_s, acc_s, out_s, M, N, K, naive ? 1 : TILE, err_s, tol_s);
 
     HIP_CHECK(hipFree(d_A));
     HIP_CHECK(hipFree(d_B));
@@ -237,11 +310,13 @@ static int parse_dim(const char* name, const char* s) {
 int main(int argc, char** argv) {
     double duration = 30.0;
     const char* precision = "fp64";
+    const char* kernel = "blocked";
     int M = 4096, N = 4096, K = 4096;
     for (int i = 1; i < argc; i += 2) {
         if (i + 1 >= argc) { fprintf(stderr, "Argument without value: %s\n", argv[i]); return 1; }
         if      (!strcmp(argv[i], "--duration"))  duration = atof(argv[i + 1]);
         else if (!strcmp(argv[i], "--precision")) precision = argv[i + 1];
+        else if (!strcmp(argv[i], "--kernel"))    kernel = argv[i + 1];
         else if (!strcmp(argv[i], "--size"))      M = N = K = parse_dim("--size", argv[i + 1]);
         else if (!strcmp(argv[i], "--m"))         M = parse_dim("--m", argv[i + 1]);
         else if (!strcmp(argv[i], "--n"))         N = parse_dim("--n", argv[i + 1]);
@@ -249,9 +324,23 @@ int main(int argc, char** argv) {
         else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); return 1; }
     }
     if (duration <= 0) { fprintf(stderr, "--duration must be > 0 \n"); return 1; }
+    bool naive;
+    if      (!strcmp(kernel, "blocked")) naive = false;
+    else if (!strcmp(kernel, "naive"))   naive = true;
+    else { fprintf(stderr, "--kernel '%s' not supported (blocked, naive)\n", kernel); return 1; }
+    if (naive) {
+        if (((size_t)M * N + TPB - 1) / TPB > UINT_MAX) { fprintf(stderr, "M*N too big for the grid\n"); return 1; }
+    } else {
+        if (M % TILE != 0 || N % TILE != 0) {
+            fprintf(stderr, "--m and --n must be multiples of %d for --kernel blocked (got M=%d, N=%d)\n",
+                    TILE, M, N);
+            return 1;
+        }
+        if (M / TILE > 65535) { fprintf(stderr, "--m too big (max %d)\n", 65535 * TILE); return 1; }
+    }
 
 #define RUN(T, ACC, CT, IN_S, ACC_S, OUT_S) \
-    return run<T, ACC, CT>(duration, M, N, K, precision, IN_S, ACC_S, OUT_S)
+    return run<T, ACC, CT>(duration, naive, M, N, K, precision, IN_S, ACC_S, OUT_S)
 
     if      (!strcmp(precision, "fp64"))       RUN(double,   double,   double,   "fp64",  "fp64",  "fp64");
     else if (!strcmp(precision, "fp32"))       RUN(float,    float,    float,    "fp32",  "fp32",  "fp32");

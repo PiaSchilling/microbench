@@ -9,7 +9,10 @@ Benchmarks für die MI300A (gfx942) als Trainingsbasis für Powersched.
 | `fma_*`   | VALU Multiply-Add (fp64/fp32/fp16) | Compute, compute-bound |
 | `stream_*` | Copy-Stream | Bandbreite L1 / L2 / Infinity Cache / HBM (nur HBM macht wirklich sinn, die anderen sind Overhead dominiert) |
 | `chase_*` | Pointer Chasing, ein Thread | Speicherlatenz L1 / L2 / Infinity Cache / HBM |
-| `gemm_*`  | naive Matrixmultiplikation | gemischt, „real world“-Muster |
+| `gemm_*`       | geblockte Matrixmultiplikation (LDS-Kacheln)  | Compute und Speicher, AI über K steuerbar                    |
+| `gemm_naive_*` | naive Matrixmultiplikation (`--kernel naive`) | viel Cache-Verkehr, kaum Rechenauslastung (vorläufig) |
+
+
 
 ## Verzeichnisstruktur
 
@@ -45,6 +48,7 @@ Pro Lauf entsteht `results/<datum>_<host>/` mit:
 
 - Keine Hardware-Counter. Geplant ist rocprofv3.
 - Working-Set-Größen in `runs.conf` sind fest auf MI300A eingetragen, noch nicht aus einer System-Config berechnet.
-- GEMM ist bewusst naiv (kein Tiling, kein LDS, keine Matrix Cores) und erreicht daher nur einen kleinen Teil der Peak-Leistung. `a_gbyte` ist dort der minimale Speicherverkehr, der tatsächliche liegt höher.
+- GEMM gibt im JSON `traffic_model` aus: `kernel_level` (geblockt) oder `minimal` (naiv).
+- GEMM: `--m` und `--n` müssen Vielfache von 128 sein.
 - Integer-Varianten von `fma` sind implementiert, aber noch nicht validiert (in `runs.conf` auskommentiert).
 - Nur eine GPU pro Lauf (`--gpu` bzw. `HIP_VISIBLE_DEVICES`).
