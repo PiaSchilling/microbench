@@ -6,7 +6,8 @@
 #   STATUS ok|error
 #   REASON <text>                  (all contract violations, separated by "; ")
 #   VERIFY true|false|null
-#   FRAGMENT <json members>        benchmark fields as  "k":v,"k":v  (no braces)
+#   FRAGMENT <json members>        benchmark fields as  "k":v,"k":v  (no braces);
+#                                  fields with reserved or invalid names are left out
 
 {
     sub(/\r$/, "")
@@ -43,11 +44,11 @@ function check(    i, k, n, req, rt, ws) {
     # field names
     n = split("label rep benchmark benchmark_version mode device status reason exit_code cmd", req, " ")
     for (i = 1; i <= n; i++)
-        if (req[i] in J_idx) violation("field '" req[i] "' is reserved for the wrapper")
+        if (req[i] in J_idx) { violation("field '" req[i] "' is reserved for the wrapper"); drop[req[i]] = 1 }
     for (i = 1; i <= J_n; i++) {
         k = J_key[i]
-        if (k !~ /^[A-Za-z_][A-Za-z0-9_]*$/) violation("invalid field name '" k "'")
-        else if (k ~ /^m_/) violation("prefix m_ is reserved for the wrapper ('" k "')")
+        if (k !~ /^[A-Za-z_][A-Za-z0-9_]*$/) { violation("invalid field name '" k "'"); drop[k] = 1 }
+        else if (k ~ /^m_/) { violation("prefix m_ is reserved for the wrapper ('" k "')"); drop[k] = 1 }
     }
 
     # required numeric fields
@@ -91,6 +92,8 @@ function check(    i, k, n, req, rt, ws) {
             violation("a_intensity does not equal a_gflop / a_gbyte")
     }
 
+    # fields with reserved or invalid names are left out, so the record stays valid
     for (i = 1; i <= J_n; i++)
-        fragment = fragment (i > 1 ? "," : "") jstr(J_key[i]) ":" J_val[i]
+        if (!(J_key[i] in drop))
+            fragment = fragment (fragment == "" ? "" : ",") jstr(J_key[i]) ":" J_val[i]
 }

@@ -164,7 +164,7 @@ The benchmark's stdout is the **machine channel to the wrapper**. Users do not s
 | `d_gbyte_per_s` | number | |
 | `verify_ok` | bool/null | `null` if the benchmark has no verification |
 
-Additional fields are allowed (e.g. `precision`, `op_type`, `e_blocks`, `e_working_set_bytes`). If an effective value differs from the requested one, it must be reported as an `e_` field. Field names match `[A-Za-z_][A-Za-z0-9_]*`; the wrapper field names (Section 10) and the prefix `m_` are reserved.
+Additional fields are allowed (e.g. `precision`, `op_type`, `e_blocks`, `e_working_set_bytes`). If an effective value differs from the requested one, it must be reported as an `e_` field. Field names match `[A-Za-z_][A-Za-z0-9_]*`; the wrapper field names (Section 10) and the prefix `m_` are reserved. Fields with reserved or invalid names make the run `error` and are left out of the result record.
 
 ### Contract check by the wrapper
 

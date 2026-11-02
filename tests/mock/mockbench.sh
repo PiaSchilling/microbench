@@ -8,6 +8,11 @@
 #   verifyfail  correct output with verify_ok=false, exit 3
 #   badjson     broken JSON on stdout
 #   contract    valid JSON that violates the contract (missing field, wrong rate)
+#   shortrun    runtime_s shorter than the requested duration
+#   roi         ROI in the monotonic clock does not match runtime_s
+#   twolines    the JSON line twice on stdout
+#   reserved    uses field names reserved for the wrapper (status, m_*)
+#   verify0     verify_ok=false, but exit code 0
 #   hang        never finishes (for the timeout test)
 
 behavior=$1
@@ -56,13 +61,16 @@ t1=$(date +%s%N)
 
 verify=true rc=0
 [[ $behavior == verifyfail ]] && verify=false rc=3
+[[ $behavior == verify0 ]] && verify=false
 
 # monotonic-like timestamps (realtime modulo 1e15 ns, exact in bash integers)
 m0=$((t0 % 1000000000000000)) m1=$((t1 % 1000000000000000))
-awk -v t0="$t0" -v t1="$t1" -v m0="$m0" -v m1="$m1" -v ops="$ops" -v prec="$precision" -v verify="$verify" -v behavior="$behavior" 'BEGIN {
+line=$(awk -v t0="$t0" -v t1="$t1" -v m0="$m0" -v m1="$m1" -v ops="$ops" -v prec="$precision" -v verify="$verify" -v behavior="$behavior" 'BEGIN {
     rt = (t1 - t0) / 1e9
     it = int(rt / 0.0005); if (it < 1) it = 1
     gflop = it * ops * 1e-6; gbyte = it * 1e-3
+    if (behavior == "shortrun") rt = rt / 10        # claims a shorter run
+    if (behavior == "roi") m1 = sprintf("%.0f", m0 + 3 * (m1 - m0))   # ROI three times too long
     gflops = gflop / rt
     if (behavior == "contract") gflops *= 2          # wrong rate
     printf "{\"runtime_s\": %.9f, \"iterations\": %d, ", rt, it
@@ -71,6 +79,9 @@ awk -v t0="$t0" -v t1="$t1" -v m0="$m0" -v m1="$m1" -v ops="$ops" -v prec="$prec
     if (behavior != "contract") printf "\"e_pci_bus_id\": \"0000:01:00.0\", "
     printf "\"a_gflop\": %.9g, \"a_gbyte\": %.9g, \"a_intensity\": %.9g, ", gflop, gbyte, gflop / gbyte
     printf "\"d_gflop_per_s\": %.9g, \"d_gbyte_per_s\": %.9g, ", gflops, gbyte / rt
+    if (behavior == "reserved") printf "\"status\": \"done\", \"m_power\": 1, "
     printf "\"verify_ok\": %s, \"precision\": \"%s\", \"e_blocks\": 1824}\n", verify, prec
-}'
+}')
+printf '%s\n' "$line"
+[[ $behavior == twolines ]] && printf '%s\n' "$line"
 exit $rc

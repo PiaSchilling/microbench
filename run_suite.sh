@@ -47,11 +47,11 @@ DO_LIST=0
 
 # run table (index = position in the run config)
 RUN_LABEL=() RUN_BENCH=() RUN_ARGS=() RUN_LINE=()
-RUN_EFF=()      # effective arguments after {DURATION} substitution
-RUN_DUR=()      # effective duration
-RUN_SKIP=()     # reason if skipped by the precision filter
-RUN_BAD=()      # 1 if the run failed validation
-SEL=()          # selected run indices (after --only)
+RUN_EFF=()                # effective arguments after {DURATION} substitution
+RUN_DUR=()                # effective duration
+RUN_SKIP_PREC=()          # reason text if the precision filter skips the run ("" otherwise)
+RUN_FAILED_VALIDATION=()  # 1 if the run failed validation in phase 3 (then the wrapper aborts)
+SEL=()                    # selected run indices (after --only)
 declare -A LABEL_IDX=()
 PLAN=()         # "<round>:<index>"
 
@@ -306,25 +306,25 @@ validate_runs() {
         label=${RUN_LABEL[i]}
         bench=${RUN_BENCH[i]}
         ctx="$CONFIG:${RUN_LINE[i]} ($label)"
-        RUN_BAD[i]=0
+        RUN_FAILED_VALIDATION[i]=0
         RUN_DUR[i]=""
-        RUN_SKIP[i]=""
+        RUN_SKIP_PREC[i]=""
 
-        if ! meta_load "$bench" "$SRC_DIR"; then RUN_BAD[i]=1; continue; fi
+        if ! meta_load "$bench" "$SRC_DIR"; then RUN_FAILED_VALIDATION[i]=1; continue; fi
         bin="$BIN_DIR/$bench"
         if [[ ! -x $bin ]]; then
             add_error "$ctx: binary '$bin' not found or not executable (run build.sh)"
-            RUN_BAD[i]=1
+            RUN_FAILED_VALIDATION[i]=1
         fi
 
         if [[ ${RUN_ARGS[i]} == *[\"\']* ]]; then
             add_error "$ctx: quotes are not allowed in arguments"
-            RUN_BAD[i]=1; continue
+            RUN_FAILED_VALIDATION[i]=1; continue
         fi
         read -r -a toks <<<"${RUN_ARGS[i]}"
         if ((${#toks[@]} % 2)); then
             add_error "$ctx: arguments must be pairs '--key value'"
-            RUN_BAD[i]=1; continue
+            RUN_FAILED_VALIDATION[i]=1; continue
         fi
 
         seen=() eff=() prec=""
@@ -333,31 +333,31 @@ validate_runs() {
             v=${toks[j + 1]}
             if [[ ! $k =~ ^--[a-z_][a-z0-9_]*$ ]]; then
                 add_error "$ctx: '$k' is not an option of the form --key"
-                RUN_BAD[i]=1; continue
+                RUN_FAILED_VALIDATION[i]=1; continue
             fi
             if [[ $v == --* ]]; then
                 add_error "$ctx: option $k has no value"
-                RUN_BAD[i]=1; continue
+                RUN_FAILED_VALIDATION[i]=1; continue
             fi
             if [[ -v seen[$k] ]]; then
                 add_error "$ctx: option $k is given twice"
-                RUN_BAD[i]=1; continue
+                RUN_FAILED_VALIDATION[i]=1; continue
             fi
             seen[$k]=1
             if [[ $k == --check ]]; then
                 add_error "$ctx: --check must not be used in the run config"
-                RUN_BAD[i]=1; continue
+                RUN_FAILED_VALIDATION[i]=1; continue
             fi
             if [[ $k == --duration ]]; then
                 [[ $MODE == check || $v == "{DURATION}" ]] && v=$DURATION
                 if ! { is_number "$v" && positive "$v"; }; then
                     add_error "$ctx: --duration must be a positive number or {DURATION} (got '$v')"
-                    RUN_BAD[i]=1
+                    RUN_FAILED_VALIDATION[i]=1
                 fi
                 RUN_DUR[i]=$v
             elif [[ $v == *"{DURATION}"* ]]; then
                 add_error "$ctx: {DURATION} is only allowed as value of --duration"
-                RUN_BAD[i]=1
+                RUN_FAILED_VALIDATION[i]=1
             fi
             [[ $k == --precision ]] && prec=$v
             if [[ ! -v "META_${bench}[param.${k#--}]" ]]; then
@@ -367,7 +367,7 @@ validate_runs() {
         done
         if [[ ! -v seen[--duration] ]]; then
             add_error "$ctx: --duration is missing (mandatory)"
-            RUN_BAD[i]=1
+            RUN_FAILED_VALIDATION[i]=1
         fi
 
         # precision filter (contract section 3)
@@ -375,11 +375,11 @@ validate_runs() {
             bprec=$(meta_get "$bench" precisions)
             if [[ -z $bprec ]]; then
                 add_error "$ctx: --precision is given, but $bench declares no 'precisions' in its metadata"
-                RUN_BAD[i]=1
+                RUN_FAILED_VALIDATION[i]=1
             elif ! in_list "$prec" "$bprec"; then
-                RUN_SKIP[i]="precision $prec is not implemented by $bench (precisions=$bprec)"
+                RUN_SKIP_PREC[i]="precision $prec is not implemented by $bench (precisions=$bprec)"
             elif ! in_list "$prec" "${COMP[precisions]:-}"; then
-                RUN_SKIP[i]="precision $prec is not supported by the hardware (component config)"
+                RUN_SKIP_PREC[i]="precision $prec is not supported by the hardware (component config)"
             fi
         fi
         RUN_EFF[i]="${eff[*]}"
@@ -405,13 +405,13 @@ check_args() {
     local i bench bin
     local -a args
     for i in "${SEL[@]}"; do
-        ((RUN_BAD[i])) && continue
+        ((RUN_FAILED_VALIDATION[i])) || [[ -n ${RUN_SKIP_PREC[i]} ]] && continue
         bench=${RUN_BENCH[i]}
         read -r -a args <<<"${RUN_EFF[i]}"
         run_check "$BIN_DIR/$bench" "${args[@]}"
         if ((CHECK_RC != 0)); then
             add_error "$CONFIG:${RUN_LINE[i]} (${RUN_LABEL[i]}): '$bench --check' rejected the arguments (exit $CHECK_RC): ${CHECK_MSG:-no message}"
-            RUN_BAD[i]=1
+            RUN_FAILED_VALIDATION[i]=1
         fi
     done
 }
@@ -475,8 +475,8 @@ print_plan() {
     pinfo "Plan: mode $MODE, ${#SEL[@]} run(s) x $REPEAT round(s), device $DEVICE, duration $DURATION s$mode_note, pause $PAUSE s"
     ((SHUFFLE)) && pinfo "      order shuffled within each round, seed $SEED"
     for i in "${SEL[@]}"; do
-        if [[ -n ${RUN_SKIP[i]} ]]; then
-            pinfo "  $(printf "%-${LW}s  %-${BW}s  skipped: %s" "${RUN_LABEL[i]}" "${RUN_BENCH[i]}" "${RUN_SKIP[i]}")"
+        if [[ -n ${RUN_SKIP_PREC[i]} ]]; then
+            pinfo "  $(printf "%-${LW}s  %-${BW}s  skipped: %s" "${RUN_LABEL[i]}" "${RUN_BENCH[i]}" "${RUN_SKIP_PREC[i]}")"
         else
             pinfo "  $(printf "%-${LW}s  %-${BW}s  %s" "${RUN_LABEL[i]}" "${RUN_BENCH[i]}" "${RUN_EFF[i]}")"
         fi
@@ -484,7 +484,7 @@ print_plan() {
     total=0
     for p in "${PLAN[@]}"; do
         i=${p#*:}
-        [[ -n ${RUN_SKIP[i]} ]] && continue
+        [[ -n ${RUN_SKIP_PREC[i]} ]] && continue
         execs=$((execs + 1))
         total=$(awk -v t="$total" -v d="${RUN_DUR[i]}" 'BEGIN { print t + d }')
     done
@@ -555,9 +555,9 @@ run_one() {
     cmd=${cmd% }
     RAN=0
 
-    if [[ -n ${RUN_SKIP[i]} ]]; then
+    if [[ -n ${RUN_SKIP_PREC[i]} ]]; then
         status=skipped
-        reason=${RUN_SKIP[i]}
+        reason=${RUN_SKIP_PREC[i]}
     else
         RAN=1
         mkdir -p "$dir"
@@ -641,7 +641,7 @@ execute() {
     # index of the last plan entry that is actually executed (no pause after it)
     for k in "${!PLAN[@]}"; do
         i=${PLAN[k]#*:}
-        [[ -z ${RUN_SKIP[i]} ]] && last_exec=$k
+        [[ -z ${RUN_SKIP_PREC[i]} ]] && last_exec=$k
     done
 
     trap 'on_signal INT' INT
