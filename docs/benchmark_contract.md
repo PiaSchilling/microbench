@@ -1,5 +1,5 @@
 status: draft
-version: 0.7.0
+version: 0.7.1
 
 # Benchmark Contract and Wrapper Interfaces
 
@@ -252,7 +252,7 @@ fma_fp32        fma     --duration {DURATION} --ops_per_element 1000000 --precis
 Rules:
 
 - Fields are separated by whitespace. Values contain no whitespace and no quotes.
-- Comments only as full lines starting with `#`. Empty lines are ignored.
+- `#` starts a comment, either as a whole line or at the end of a line (`... --k 1   # AI 0.25`). Empty lines are ignored.
 - `label`: unique within the file, characters `A-Z a-z 0-9 _ -` only (used in file and directory names). Used in logs and for `--only`.
 - `benchmark`: name of a benchmark in `src/` (Section 1).
 - `{DURATION}` is replaced by the duration of the current mode (Section 11). A fixed value instead of the placeholder takes precedence, except in `check` mode, where every `--duration` is replaced by the check duration. A line without `--duration` is an error, as is `{DURATION}` as value of another option.

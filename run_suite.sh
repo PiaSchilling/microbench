@@ -275,8 +275,9 @@ parse_runs() {
     while IFS= read -r line || [[ -n $line ]]; do
         n=$((n + 1))
         line=${line%$'\r'}
+        line=${line%%#*}             # comment: whole line or rest of the line after '#'
         trim line
-        [[ -z $line || $line == \#* ]] && continue
+        [[ -z $line ]] && continue
         label="" bench="" rest=""
         read -r label bench rest <<<"$line"
         if [[ -z $bench ]]; then

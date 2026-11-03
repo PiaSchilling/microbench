@@ -414,6 +414,16 @@ test_line_without_benchmark() {
     check_rejected "expected '<label> <benchmark> <arguments ...>'"
 }
 
+register trailing_comment_in_run_config
+test_trailing_comment_in_run_config() {
+    cfg "a  mock_ok  --duration {DURATION} --precision fp64     # comment at the end of the line"
+    wrap --mode check
+    check_rc 0
+    check_status a 1 ok
+    need_dir || return
+    check_not_contains "$DIR/runs/a/rep1/pass0/command.txt" "comment"
+}
+
 register empty_run_config
 test_empty_run_config() {
     cfg "# only a comment"
