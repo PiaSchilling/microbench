@@ -70,3 +70,8 @@ Temporary Items
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,c++
 
+
+### Benchmark suite ###
+# built binaries (build.sh) and result directories (run_suite.sh)
+build/
+results/

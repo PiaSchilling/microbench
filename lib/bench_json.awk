@@ -6,6 +6,8 @@
 #   STATUS ok|error
 #   REASON <text>                  (all contract violations, separated by "; ")
 #   VERIFY true|false|null
+#   ROI <start_mono_ns> <end_mono_ns>   (only if both are valid; raw text, no rounding)
+#   BDF <pci address>                   (only if e_pci_bus_id is valid)
 #   FRAGMENT <json members>        benchmark fields as  "k":v,"k":v  (no braces);
 #                                  fields with reserved or invalid names are left out
 
@@ -37,6 +39,8 @@ END {
     print "STATUS " (reason == "" ? "ok" : "error")
     print "REASON " reason
     print "VERIFY " verify
+    if (roi != "") print "ROI " roi
+    if (bdf != "") print "BDF " bdf
     print "FRAGMENT " fragment
 }
 
@@ -62,6 +66,7 @@ function check(    i, k, n, req, rt, ws) {
     else if (J_type[J_idx["e_pci_bus_id"]] != "s" ||
              jdecode(J_val[J_idx["e_pci_bus_id"]]) !~ /^[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]:[0-9a-fA-F][0-9a-fA-F]\.[0-7]$/)
         violation("e_pci_bus_id must be a PCI address like \"0000:42:00.0\"")
+    else bdf = tolower(jdecode(J_val[J_idx["e_pci_bus_id"]]))
     if (!("verify_ok" in J_idx)) violation("required field 'verify_ok' missing")
     else if (J_type[J_idx["verify_ok"]] != "b" && J_type[J_idx["verify_ok"]] != "z")
         violation("verify_ok must be true, false or null")
@@ -79,6 +84,7 @@ function check(    i, k, n, req, rt, ws) {
             violation("roi_end_mono_ns must be greater than roi_start_mono_ns")
         else if (!close_to((num("roi_end_mono_ns") - num("roi_start_mono_ns")) / 1e9, rt, 0.01, 1e-3))
             violation("ROI length in monotonic clock does not match runtime_s")
+        else roi = J_val[J_idx["roi_start_mono_ns"]] " " J_val[J_idx["roi_end_mono_ns"]]
         if (num("roi_end_unix") <= num("roi_start_unix"))
             violation("roi_end_unix must be greater than roi_start_unix")
         else if (!close_to(num("roi_end_unix") - num("roi_start_unix"), rt, 0.01, 1e-2))

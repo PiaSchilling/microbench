@@ -9,7 +9,8 @@ Specification: [docs/benchmark_contract.md](docs/benchmark_contract.md)
 ## Quick start
 
 ```bash
-./build.sh                                   # build all benchmarks in src/ into build/
+./build.sh                                   # build all benchmarks in src/ and the sampler into build/
+./build/sampler --probe 5                    # how often does the GPU refresh its telemetry?
 ./run_suite.sh --list                        # available benchmarks
 ./run_suite.sh --help fma                    # parameters of one benchmark
 ./run_suite.sh --mode check                  # do all runs work and follow the contract?
@@ -34,6 +35,6 @@ tests/run_tests.sh -v     # also show the wrapper output of failed tests
 |---|---|
 | Wrapper: configs, metadata, validation, plan, execution, contract check, results, repetitions, aggregation, timeout, signals, help | implemented |
 | Build script | implemented |
-| Telemetry sampler (`tools/sampler.c`) | open |
+| Telemetry: sampler (`tools/sampler.c`) and its use in the wrapper (ROI cut, energy, `m_*` fields, idle baseline) | implemented, tested with a mock sampler; not yet tested on the GPU |
 | Hardware counters (rocprofv3 passes, pass planner) | open |
 | Slurm integration | open |

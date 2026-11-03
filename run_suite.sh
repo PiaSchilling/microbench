@@ -4,8 +4,8 @@
 # Specification: docs/benchmark_contract.md (sections 9-14)
 # Implemented:   modes, run/component config, metadata, validation, plan,
 #                execution, contract check, results (JSONL/CSV/TSV), repetitions,
-#                aggregation, timeout, signal handling, help
-# Not yet:       monitoring (sampler, rocprofv3 passes) - m_* fields stay empty
+#                aggregation, timeout, signal handling, help, telemetry (sampler)
+# Not yet:       hardware counters (rocprofv3 passes) - validation runs only pass 0
 
 set -uo pipefail
 
@@ -24,6 +24,7 @@ TIMEOUT_FACTOR=2        # per-run timeout = duration * factor + offset
 TIMEOUT_OFFSET=60
 KILL_AFTER=10           # SIGKILL this many seconds after SIGTERM on timeout
 DEFAULT_SEED=1
+SAMPLER_START_TIMEOUT=5 # seconds to wait for the first telemetry sample
 WRAPPER_FIELDS="label rep benchmark benchmark_version mode device status reason exit_code cmd"
 
 MODE=""
@@ -37,13 +38,15 @@ OPT_PAUSE=""
 OPT_TIMEOUT=""
 REPEAT=1
 SHUFFLE=0
-SEED=$DEFAULT_SEED
+SEED=$DEFAULT_SEED  # Seed for shuffle 
 ONLY=""
 DEVICE=0
 DRY_RUN=0
 DO_HELP=0
 HELP_BENCH=""
 DO_LIST=0
+SAMPLE_INTERVAL=100     # ms between two telemetry samples (--sample-interval)
+IDLE_SECONDS=5          # idle baseline before the first run (--idle)
 
 # run table (index = position in the run config)
 RUN_LABEL=() RUN_BENCH=() RUN_ARGS=() RUN_LINE=()
@@ -57,6 +60,12 @@ PLAN=()         # "<round>:<index>"
 
 RESDIR=""
 CHILD_PID=""
+SAMPLER_PID=""          # telemetry sampler running in the background
+SAMPLER_DIED=0          # 1 if the sampler stopped during the runs
+TELEMETRY=""            # telemetry.csv of the current invocation
+TEL_HEADER=""           # its header line
+TEL_GPUS=""             # PCI addresses the sampler sees
+TEL_LINES=0             # lines in telemetry.csv when the current run started
 declare -A COUNT=([ok]=0 [skipped]=0 [error]=0 [invalid]=0 [timeout]=0)
 
 # ---------------------------------------------------------------------------
@@ -74,7 +83,7 @@ Modes:
                comply with the contract? (no monitoring)
   validation   medium duration, telemetry + hardware counters
   production   long duration, telemetry only
-  (monitoring is not implemented yet; validation/production run without it)
+  (hardware counters are not implemented yet; validation runs telemetry only)
 
 Options:
   --config <file>       run config                (default: config/runs.cfg)
@@ -87,6 +96,8 @@ Options:
   --only <l1,l2,...>    run only these labels
   --device <n>          GPU index, set as HIP_VISIBLE_DEVICES (default: 0)
   --timeout <s>         per-run timeout           (default: duration x $TIMEOUT_FACTOR + $TIMEOUT_OFFSET)
+  --sample-interval <ms> telemetry interval       (default: $SAMPLE_INTERVAL; validation/production)
+  --idle <s>            idle baseline before the first run (default: $IDLE_SECONDS; 0: none)
   --dry-run             validate and print the plan, run nothing
   --results <dir>       where result directories are created (default: results/)
   --src-dir <dir>       benchmark sources         (default: src/)
@@ -102,6 +113,7 @@ Exit codes: 0 all runs ok or skipped    1 invalid options or validation failed
 EOF
 }
 
+# prints a list of all available benchmarks found in the src directory
 list_benchmarks() {
     local f name files=()
     shopt -s nullglob
@@ -123,6 +135,7 @@ list_benchmarks() {
     done
 }
 
+# prints help output for th specified benchmark by parsing the benchmark metadata from the src/*.cpp header
 help_benchmark() {
     local name=$1 k def valid effect bin
     if ! meta_load "$name" "$SRC_DIR"; then
@@ -189,6 +202,7 @@ last_line() { awk 'NF { l = $0 } END { print substr(l, 1, 200) }' "$1" 2>/dev/nu
 # Phase 1: arguments
 # ---------------------------------------------------------------------------
 
+# parses command line arguments into the corresponding variables. 
 parse_args() {
     while (($#)); do
         case $1 in
@@ -201,6 +215,8 @@ parse_args() {
             --only)      optval "$@"; ONLY=$2; shift 2 ;;
             --device)    optval "$@"; DEVICE=$2; shift 2 ;;
             --timeout)   optval "$@"; OPT_TIMEOUT=$2; shift 2 ;;
+            --sample-interval) optval "$@"; SAMPLE_INTERVAL=$2; shift 2 ;;
+            --idle)      optval "$@"; IDLE_SECONDS=$2; shift 2 ;;
             --results)   optval "$@"; RESULTS_ROOT=$2; shift 2 ;;
             --src-dir)   optval "$@"; SRC_DIR=$2; shift 2 ;;
             --bin-dir)   optval "$@"; BIN_DIR=$2; shift 2 ;;
@@ -237,6 +253,9 @@ parse_args() {
         die "--timeout must be a positive number"
     [[ $REPEAT =~ ^[1-9][0-9]*$ ]] || die "--repeat must be an integer >= 1"
     is_uint "$DEVICE" || die "--device must be an integer >= 0"
+    [[ $SAMPLE_INTERVAL =~ ^[1-9][0-9]*$ ]] && ((SAMPLE_INTERVAL <= 60000)) ||
+        die "--sample-interval must be an integer between 1 and 60000 (ms)"
+    is_number "$IDLE_SECONDS" || die "--idle must be a number >= 0"
 
     DURATION=${OPT_DURATION:-${MODE_DURATION[$MODE]}}
     PAUSE=${OPT_PAUSE:-${MODE_PAUSE[$MODE]}}
@@ -246,6 +265,7 @@ parse_args() {
 # Phase 2: load
 # ---------------------------------------------------------------------------
 
+# parses the run configuration file (and checks for incorrectly formatted run configurations)
 parse_runs() {
     local file=$1 line n=0 label bench rest
     if [[ ! -r $file ]]; then
@@ -280,6 +300,7 @@ parse_runs() {
     ((${#RUN_LABEL[@]})) || add_error "$file: no runs defined"
 }
 
+# selects the benchmarks specified via the --only parameter 
 select_runs() {
     local l i
     local -a want
@@ -489,6 +510,10 @@ print_plan() {
         total=$(awk -v t="$total" -v d="${RUN_DUR[i]}" 'BEGIN { print t + d }')
     done
     ((execs > 1)) && total=$(awk -v t="$total" -v p="$PAUSE" -v n="$execs" 'BEGIN { print t + p * (n - 1) }')
+    if monitoring; then
+        pinfo "Telemetry: sampler every $SAMPLE_INTERVAL ms, idle baseline $IDLE_SECONDS s"
+        total=$(awk -v t="$total" -v i="$IDLE_SECONDS" 'BEGIN { print t + i }')
+    fi
     pinfo "Estimated time: at least $(fmt_secs "$total") for $execs execution(s) (runs + pauses, without start-up and verification)"
 }
 
@@ -521,6 +546,122 @@ prepare() {
 }
 
 # ---------------------------------------------------------------------------
+# Telemetry (sampler, contract section 13)
+# ---------------------------------------------------------------------------
+# The sampler writes telemetry.csv with one line per GPU and sample. Its first
+# three columns are mono_ns, unix_ns and bdf; the waits below rely on that.
+
+monitoring() { [[ $MODE != check ]]; }
+
+sampler_alive() { [[ -n $SAMPLER_PID ]] && kill -0 "$SAMPLER_PID" 2>/dev/null; }
+
+# start the sampler and wait for its first sample (phase 5)
+start_sampler() {
+    local w tries=$((SAMPLER_START_TIMEOUT * 20)) rc
+    TELEMETRY=$RESDIR/telemetry.csv
+    "$BIN_DIR/sampler" --interval-ms "$SAMPLE_INTERVAL" --out "$TELEMETRY" 2>"$RESDIR/sampler.log" &
+    SAMPLER_PID=$!
+    log "SAMPLER started: pid $SAMPLER_PID, interval $SAMPLE_INTERVAL ms"
+    for ((w = 0; w < tries; w++)); do
+        if ! sampler_alive; then
+            wait "$SAMPLER_PID"
+            rc=$?
+            SAMPLER_PID=""
+            die "sampler exited at start (exit $rc): $(last_line "$RESDIR/sampler.log")"
+        fi
+        [[ -s $TELEMETRY ]] && (($(wc -l <"$TELEMETRY") >= 2)) && break
+        sleep 0.05
+    done
+    if ((w == tries)); then
+        stop_sampler
+        die "no telemetry from the sampler after $SAMPLER_START_TIMEOUT s (see $RESDIR/sampler.log)"
+    fi
+    TEL_HEADER=$(head -1 "$TELEMETRY")
+    if [[ $TEL_HEADER != mono_ns,unix_ns,bdf,* ]]; then
+        stop_sampler
+        die "unexpected header in $TELEMETRY: ${TEL_HEADER:0:80}"
+    fi
+    TEL_GPUS=$(awk -F, 'NR > 1 { if ($3 in s) exit; s[$3] = 1; printf "%s%s", (n++ ? " " : ""), $3 }' "$TELEMETRY")
+    info "Telemetry: sampler running every $SAMPLE_INTERVAL ms, GPUs: $TEL_GPUS"
+    log "SAMPLER GPUs: $TEL_GPUS"
+}
+
+stop_sampler() {
+    [[ -n $SAMPLER_PID ]] || return 0
+    kill -TERM "$SAMPLER_PID" 2>/dev/null
+    wait "$SAMPLER_PID" 2>/dev/null
+    SAMPLER_PID=""
+    log "SAMPLER stopped"
+}
+
+# wait_for_sample_after <column 1|2> <t_ns> [<bdf>]: wait until telemetry.csv has a
+# sample later than t (column 1: mono_ns, 2: unix_ns), needed to interpolate at t.
+# Waits at most 3 intervals + 2 s; returns 1 if there is none.
+wait_for_sample_after() {
+    local c=$1 t=$2 b=${3:-} w tries=$(((3 * SAMPLE_INTERVAL + 2000) / 50))
+    for ((w = 0; w < tries; w++)); do
+        tail -n 300 "$TELEMETRY" | awk -F, -v c="$c" -v t="$t" -v b="$b" \
+            '(b == "" || $3 == b) && $c + 0 > t + 0 { f = 1 } END { exit !f }' && return 0
+        sampler_alive || return 1
+        sleep 0.05
+    done
+    return 1
+}
+
+# idle baseline (phase 6): telemetry without load, per GPU in idle/idle.csv.
+# The wrapper has no monotonic clock, so this window is cut by unix_ns.
+idle_baseline() {
+    local u0 u1 line
+    awk -v s="$IDLE_SECONDS" 'BEGIN { exit !(s > 0) }' || return 0
+    info "Idle baseline: $IDLE_SECONDS s without load"
+    mkdir -p "$RESDIR/idle"
+    u0=$(date +%s%N)
+    sleep "$IDLE_SECONDS" &
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    CHILD_PID=""
+    u1=$(date +%s%N)
+    wait_for_sample_after 2 "$u1" || warn "idle baseline: no telemetry sample after the idle window"
+    awk -F, -v timecol=unix_ns -v t0="$u0" -v t1="$u1" -f "$LIB/json.awk" -f "$LIB/telemetry.awk" \
+        "$TELEMETRY" >"$RESDIR/idle/idle.jsonl"
+    awk -f "$LIB/json.awk" -f "$LIB/jsonl2csv.awk" "$RESDIR/idle/idle.jsonl" >"$RESDIR/idle/idle.csv"
+    while IFS= read -r line; do
+        info "  $line"
+        log "IDLE   $line"
+    done < <(awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next }
+        { gsub(/"/, ""); printf "%s  power %.1f W  gfx clock %.0f MHz  temperature %s C\n",
+          $c["bdf"], $c["m_avg_power_w"], $c["m_avg_gfx_clk_mhz"], $c["m_max_temp_c"] }' "$RESDIR/idle/idle.csv")
+    rm -f "$RESDIR/idle/idle.jsonl"
+}
+
+# telemetry_for_run <dir> <roi "start end" in mono ns> <bdf>: cut telemetry to the ROI
+# of a run. Sets MFRAG (m_* JSON members) or TEL_REASON (why there is no telemetry).
+telemetry_for_run() {
+    local dir=$1 roi=$2 bdf=$3 t0 t1 from line
+    MFRAG="" TEL_REASON=""
+    read -r t0 t1 <<<"$roi"
+    if ! wait_for_sample_after 1 "$t1" "$bdf"; then
+        if ! tail -n 300 "$TELEMETRY" | grep -qF ",$bdf,"; then
+            TEL_REASON="no samples for device $bdf (sampler sees: $TEL_GPUS)"
+        else
+            TEL_REASON="no sample after the end of the ROI for device $bdf"
+        fi
+        return
+    fi
+    # only the part of the file written since shortly before the run
+    from=$((TEL_LINES > 300 ? TEL_LINES - 300 : 1))
+    line=$(tail -n +"$from" "$TELEMETRY" | awk -F, -v header="$TEL_HEADER" -v t0="$t0" -v t1="$t1" \
+        -v bdf="$bdf" -v cut="$dir/telemetry_roi.csv" -f "$LIB/json.awk" -f "$LIB/telemetry.awk")
+    if [[ -z $line ]]; then
+        TEL_REASON="no samples for device $bdf around the ROI"
+        return
+    fi
+    line=${line#\{}
+    line=${line%\}}
+    MFRAG=${line#*\"bdf\":\"*\",}     # drop the bdf member, keep the m_* fields
+}
+
+# ---------------------------------------------------------------------------
 # Phase 7: execute
 # ---------------------------------------------------------------------------
 
@@ -531,6 +672,7 @@ on_signal() {
         kill -TERM "$CHILD_PID" 2>/dev/null
         wait "$CHILD_PID" 2>/dev/null
     fi
+    stop_sampler
     if [[ -n $RESDIR ]]; then
         log "ABORT  by SIG$1; completed runs are preserved"
         info "Results (incomplete): $RESDIR"
@@ -548,12 +690,13 @@ run_one() {
     local dir="$RESDIR/runs/$label/rep$r/pass0"
     local bin="$BIN_DIR/$bench"
     local status="" reason="" rc="null" fragment="" cmd tmo t0 t1 code
-    local jstatus="" jreason="" jverify="null" tag rest
+    local jstatus="" jreason="" jverify="null" tag rest roi="" bdf=""
     local -a args
     read -r -a args <<<"${RUN_EFF[i]}"
     printf -v cmd '%q ' "HIP_VISIBLE_DEVICES=$DEVICE" "$bin" "${args[@]}"
     cmd=${cmd% }
     RAN=0
+    MFRAG=""
 
     if [[ -n ${RUN_SKIP_PREC[i]} ]]; then
         status=skipped
@@ -564,6 +707,7 @@ run_one() {
         printf '%s\n' "$cmd" >"$dir/command.txt"
         tmo=${OPT_TIMEOUT:-$(awk -v d="${RUN_DUR[i]}" -v f=$TIMEOUT_FACTOR -v o=$TIMEOUT_OFFSET \
             'BEGIN { printf "%.3f", d * f + o }')}
+        monitoring && TEL_LINES=$(wc -l <"$TELEMETRY")
         t0=$(date +%s%N)
         HIP_VISIBLE_DEVICES=$DEVICE timeout --kill-after=$KILL_AFTER "$tmo" "$bin" "${args[@]}" \
             >"$dir/stdout.json" 2>"$dir/stderr.log" &
@@ -585,6 +729,8 @@ run_one() {
                             STATUS)   jstatus=$rest ;;
                             REASON)   jreason=$rest ;;
                             VERIFY)   jverify=$rest ;;
+                            ROI)      roi=$rest ;;
+                            BDF)      bdf=$rest ;;
                             FRAGMENT) fragment=$rest ;;
                         esac
                     done < <(awk -v duration="${RUN_DUR[i]}" -f "$LIB/json.awk" -f "$LIB/bench_json.awk" \
@@ -601,6 +747,14 @@ run_one() {
                         reason="exit code 0 but verify_ok=false"
                     else
                         status=ok
+                    fi
+                    # telemetry of the ROI; a run without telemetry is an error (section 13)
+                    if monitoring && [[ $status != error && -n $roi && -n $bdf ]]; then
+                        telemetry_for_run "$dir" "$roi" "$bdf"
+                        if [[ -n $TEL_REASON ]]; then
+                            status=error
+                            reason="telemetry: $TEL_REASON"
+                        fi
                     fi
                     ;;
                 1) status=error;   reason="exit code 1: $(last_line "$dir/stderr.log")" ;;
@@ -620,6 +774,7 @@ run_one() {
     rec+=",\"device\":$DEVICE,\"status\":$(json_str "$status"),\"reason\":$(json_str "$reason")"
     rec+=",\"exit_code\":$rc,\"cmd\":$(json_str "$cmd")"
     [[ -n $fragment ]] && rec+=",$fragment"
+    [[ -n $MFRAG ]] && rec+=",$MFRAG"
     rec+="}"
 
     printf '%s\n' "$rec" >>"$RESDIR/results.jsonl"
@@ -644,15 +799,16 @@ execute() {
         [[ -z ${RUN_SKIP_PREC[i]} ]] && last_exec=$k
     done
 
-    trap 'on_signal INT' INT
-    trap 'on_signal TERM' TERM
-
     awk -v kind=run -v header=1 -v tsv="$RESDIR/summary.tsv" -v lw="$LW" -v bw="$BW" \
         -f "$LIB/json.awk" -f "$LIB/row.awk"
     for k in "${!PLAN[@]}"; do
         p=${PLAN[k]}
         r=${p%%:*}
         i=${p#*:}
+        if monitoring && ! sampler_alive; then
+            SAMPLER_DIED=1
+            break
+        fi
         run_one "$r" "$i"
         if ((RAN)) && ((k < last_exec)) && awk -v p="$PAUSE" 'BEGIN { exit !(p > 0) }'; then
             sleep "$PAUSE" &
@@ -669,6 +825,11 @@ execute() {
 
 finish() {
     local line agg="$RESDIR/aggregates.jsonl.tmp" warnf="$RESDIR/aggregate.warn.tmp"
+    if ((SAMPLER_DIED)) || { [[ -n $SAMPLER_PID ]] && ! sampler_alive; }; then
+        SAMPLER_DIED=1
+        err "the sampler stopped unexpectedly; remaining runs were not executed (see $RESDIR/sampler.log)"
+    fi
+    stop_sampler
     if ((REPEAT > 1)); then
         awk -f "$LIB/json.awk" -f "$LIB/aggregate.awk" "$RESDIR/results.jsonl" >"$agg" 2>"$warnf"
         while IFS= read -r line; do warn "$line"; done <"$warnf"
@@ -686,7 +847,7 @@ finish() {
     info "Done: $summary"
     info "Results: $RESDIR"
     log "END    $summary"
-    if ((COUNT[error] + COUNT[invalid] + COUNT[timeout] > 0)); then
+    if ((SAMPLER_DIED || COUNT[error] + COUNT[invalid] + COUNT[timeout] > 0)); then
         info "Details of failed runs: $RESDIR/wrapper.log and runs/<label>/rep<i>/pass0/stderr.log"
         exit 4
     fi
@@ -714,6 +875,9 @@ fi
 validate_runs
 check_args
 [[ $MODE == check ]] && check_param_defaults
+if monitoring && [[ ! -x $BIN_DIR/sampler ]]; then
+    add_error "telemetry: sampler '$BIN_DIR/sampler' not found or not executable (build it with: build.sh sampler)"
+fi
 report_errors "nothing was run" || exit 1
 
 # phase 4: plan
@@ -724,11 +888,17 @@ for i in "${SEL[@]}"; do
     ((${#RUN_BENCH[i]} > BW)) && BW=${#RUN_BENCH[i]}
 done
 print_plan
-[[ $MODE != check ]] && notice "monitoring is not implemented yet: m_* fields stay empty, validation runs only pass 0"
+[[ $MODE == validation ]] && notice "hardware counters are not implemented yet: validation runs only pass 0 (telemetry)"
 if ((DRY_RUN)); then info "Dry run: nothing was executed."; exit 0; fi
 
 # phase 5-8
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 prepare
+if monitoring; then
+    start_sampler
+    idle_baseline
+fi
 info ""
 execute
 finish

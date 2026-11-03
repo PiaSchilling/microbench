@@ -1,5 +1,5 @@
 status: draft
-version: 0.6.0
+version: 0.7.0
 
 # Benchmark Contract and Wrapper Interfaces
 
@@ -25,7 +25,7 @@ suite/
         <name>.cpp             one file per benchmark: metadata block (Section 3) + source
     build/                     built binaries (generated, not versioned)
     tools/
-        sampler.c              telemetry sampler (Section 13)                    [not implemented yet]
+        sampler.c              telemetry sampler (Section 13)
         plan_counter_passes.sh generates the counter config (Section 13)       [not implemented yet]
     config/
         component.cfg          component config (Section 8)
@@ -300,11 +300,13 @@ results/<YYYYmmdd-HHMMSS>_<mode>/
     wrapper.log            wrapper log: start/end, plan, notices, errors
     config/                copies of run config, component config, counter config and the source of every benchmark used
     telemetry.csv          raw sampler output for all GPUs over the whole invocation (Section 13)
-    idle/                  idle baseline measurement (Section 12)
+    sampler.log            stderr of the sampler
+    idle/idle.csv          idle baseline, one row per GPU (Section 12, phase 6)
     runs/<label>/rep<i>/pass<k>/
         command.txt        exact invocation incl. environment (e.g. HIP_VISIBLE_DEVICES=0 ./fma --duration 30 ...)
         stdout.json        raw benchmark output
         stderr.log         benchmark stderr
+        telemetry_roi.csv  telemetry rows of the run's GPU covering the ROI (from the last sample before to the first after it)
         counters.csv       raw rocprofv3 output, per kernel start (passes k >= 1, validation mode only)
 ```
 
@@ -389,6 +391,8 @@ Selected with `--mode check|validation|production`.
 | `--only <label>[,<label>...]` | Run only these labels |
 | `--device <n>` | GPU index, set as `HIP_VISIBLE_DEVICES` (default 0; must be smaller than `gpus`) |
 | `--timeout <s>` | Per-run timeout (default `duration × 2 + 60 s`) |
+| `--sample-interval <ms>` | Telemetry sampling interval (default 100; 1 to 60000) |
+| `--idle <s>` | Duration of the idle baseline (default 5; 0 disables it) |
 | `--results <dir>` | Where result directories are created (default `results/`) |
 | `--src-dir <dir>`, `--bin-dir <dir>` | Benchmark sources and binaries (default `src/`, `build/`); used by the tests |
 | `--dry-run` | Stop after the plan (phase 4) |
@@ -398,10 +402,10 @@ Selected with `--mode check|validation|production`.
 
 1. **Arguments:** parse and check the wrapper options.
 2. **Load:** component config, run config, metadata of every referenced benchmark.
-3. **Validate (no GPU):** component config, run config syntax, unique labels, metadata, benchmark source and binary exist, `--duration` present, precision filter (filtered runs become `skipped`, not an error), `--check` for every run. In `check` mode additionally: every documented parameter default (`param.*`) is accepted by `--check`. **All** errors are collected and reported together; if there is any, the wrapper exits without starting a run.
+3. **Validate (no GPU):** component config, run config syntax, unique labels, metadata, benchmark source and binary exist, sampler binary exists (not in `check` mode), `--duration` present, precision filter (filtered runs become `skipped`, not an error), `--check` for every run. In `check` mode additionally: every documented parameter default (`param.*`) is accepted by `--check`. **All** errors are collected and reported together; if there is any, the wrapper exits without starting a run.
 4. **Plan:** substitute `{DURATION}`, assign devices, form the run list (rounds × runs). Print the plan and the estimated total duration (runs + pauses + idle baseline), to help choosing the Slurm time limit.
-5. **Prepare:** create the result directory, copy configs and sources, start the sampler (not in `check` mode), verify the device mapping (Section 13).
-6. **Idle baseline:** short monitoring without load (not in `check` mode), stored in `idle/`, as reference (e.g. idle power per GPU).
+5. **Prepare:** create the result directory, copy configs and sources, start the sampler (not in `check` mode) and wait for its first sample (Section 13).
+6. **Idle baseline:** `--idle` seconds without load (not in `check` mode), summarized per GPU in `idle/idle.csv` and printed, as reference (e.g. idle power per GPU). The wrapper has no monotonic clock, so this window is cut by `unix_ns`.
 7. **Execute:** for each run and each pass: start benchmark (in passes k >= 1 under rocprofv3) → evaluate (exit code, JSON, required fields) → cut telemetry and counters to the ROI → after the last pass: merge passes, append to `results.jsonl`, rewrite `results.csv`, print TSV row → pause.
 8. **Finish:** stop the sampler, aggregation (with `--repeat > 1`), final tables, wrapper exit code.
 
@@ -415,7 +419,8 @@ Selected with `--mode check|validation|production`.
 - **Timeout:** a run gets SIGTERM after `duration × 2 + 60 s` (or `--timeout`) and SIGKILL 10 s later; status `timeout`, continue with the next run.
 - **Failed run:** logged with its status, continue with the next run.
 - **Incremental results:** every run is written immediately, nothing is held back until the end.
-- **Abort (`SIGTERM`/`SIGINT`, e.g. Slurm time limit):** the wrapper stops the running benchmark and monitor processes, notes the abort in `wrapper.log` and exits. All completed runs are preserved.
+- **Abort (`SIGTERM`/`SIGINT`, e.g. Slurm time limit):** the wrapper stops the running benchmark and the sampler, notes the abort in `wrapper.log` and exits. All completed runs are preserved.
+- **Sampler fails:** if it exits at start, writes no sample within 5 s or writes an unexpected header, the wrapper stops before the first run (exit 1). If it stops during the runs, the remaining runs are not executed (exit 4): measurements without telemetry are worthless in `production`.
 
 ### Wrapper exit code
 
@@ -423,7 +428,7 @@ Selected with `--mode check|validation|production`.
 |---|---|
 | 0 | all runs `ok` or `skipped` |
 | 1 | invalid options or validation failed; nothing was run |
-| 4 | at least one run `error`, `invalid` or `timeout` |
+| 4 | at least one run `error`, `invalid` or `timeout`, or the sampler stopped during the runs |
 | 5 | aborted by signal |
 
 ---
@@ -441,15 +446,38 @@ The amd-smi command-line tool is not used: its timestamps are Unix time with one
 
 ### Sampler
 
+`tools/sampler.c`, built by `build.sh` against the amdsmi library of ROCm.
+
+```
+sampler [--interval-ms <n>] [--out <file>]       sample until SIGTERM/SIGINT
+sampler --probe <seconds> [--interval-ms <n>]    measure how often the values are refreshed
+```
+
 - **One process for all GPUs** per wrapper invocation, started in phase 5 and stopped in phase 8. One common timeline, low overhead, ready for parallel runs later.
-- **Interval** configurable (default e.g. 100 ms, `--sample-interval`).
-- **Quantities per GPU and sample:** current power, accumulated energy counter, GFX clock, memory clock, temperatures, GFX and memory utilization, VRAM usage, throttling (power/thermal violation) status.
-- **Two timestamps per sample:**
-  - `mono_ns` (`CLOCK_MONOTONIC`): same clock as the benchmark's `steady_clock`; used for cutting to the ROI.
-  - `unix_ns` (`CLOCK_REALTIME`): for humans and correlation with external logs.
-- **Output:** one CSV line per GPU and sample in `telemetry.csv`, with a `bdf` column (PCI address) identifying the GPU.
-- **Energy over the ROI:** the hardware energy counter accumulates continuously. The wrapper interpolates the counter linearly to `roi_start_mono_ns` and `roi_end_mono_ns` and takes the difference: `m_energy_j = E(end) − E(start)`. The only error is the interpolation at the two boundaries, at most a fraction of one sample interval. Average power over the ROI is `m_energy_j / runtime_s`.
-- **Device mapping:** HIP and amdsmi number devices independently, so device indices may differ. The common key is the PCI address: the benchmark reports `e_pci_bus_id`, the sampler reports `bdf`. The wrapper uses only telemetry rows whose `bdf` matches; a missing match is an error. In phase 5 the wrapper additionally checks that every device it intends to use is visible to the sampler.
+- **Source:** one call of `amdsmi_get_gpu_metrics_info` per GPU and sample. It reads the GPU metrics table, which the firmware refreshes as a whole, so all values of a row belong to the same refresh. The PCI address is read once at start (`amdsmi_get_gpu_device_bdf`); in partition modes one handle per PCI address is kept.
+- **Interval:** `--sample-interval` of the wrapper (default 100 ms). The sampler sleeps until absolute points in time (`clock_nanosleep` with `TIMER_ABSTIME`), so the interval does not drift by the time spent reading; missed points are skipped and counted.
+- **Output:** `telemetry.csv`, one line per GPU and sample, flushed after every sample. Values the table marks as unsupported (maximum of the type) are empty cells.
+
+| Column | Meaning (metrics table field) |
+|---|---|
+| `mono_ns` | `CLOCK_MONOTONIC` at the start of reading; same clock as the benchmark's `steady_clock`; used to cut to the ROI |
+| `unix_ns` | `CLOCK_REALTIME`, for humans and correlation with external logs |
+| `bdf` | PCI address of the GPU, matched with the benchmark's `e_pci_bus_id` |
+| `read_ns` | time needed to read the table (overhead of the sampler) |
+| `fw_timestamp` | firmware timestamp of the refresh (`firmware_timestamp`, 10 ns units); only compared, to see refreshes |
+| `power_w` | socket power in W (`current_socket_power`; on MI300A probably CPU + GPU) |
+| `energy_j` | energy counter in J since the start of the GPU (`energy_accumulator` × 15.259 µJ) |
+| `gfx_clk_mhz`, `gfx_clk_min_mhz`, `gfx_clk_max_mhz` | mean, min and max of the per-XCD gfx clocks (`current_gfxclks`) |
+| `mem_clk_mhz` | memory clock (`current_uclk`) |
+| `temp_hotspot_c`, `temp_mem_c` | hotspot and HBM temperature |
+| `gfx_util_pct`, `mem_util_pct` | gfx and memory controller activity (`average_gfx_activity`, `average_umc_activity`) |
+| `acc_counter` | accumulation counter, reference for the residencies (`accumulation_counter`) |
+| `ppt_residency_acc` | accumulated time with power-limit throttling (`ppt_residency_acc`, PVIOL) |
+| `thm_residency_acc` | accumulated time with thermal throttling (`socket_thm_residency_acc`, TVIOL) |
+
+- **Energy over the ROI:** the hardware energy counter accumulates continuously. The wrapper interpolates the counter linearly to `roi_start_mono_ns` and `roi_end_mono_ns` and takes the difference: `m_energy_j = E(end) − E(start)`. The only error is the interpolation at the two boundaries, at most a fraction of one sample interval. Average power over the ROI is `m_energy_j / ROI length`. The same interpolation gives the throttling shares: `100 × Δresidency / Δacc_counter` (formula from `amdsmi.h`).
+- **Device mapping:** HIP and amdsmi number devices independently, so device indices may differ. The common key is the PCI address: the benchmark reports `e_pci_bus_id`, the sampler reports `bdf`. The wrapper uses only telemetry rows whose `bdf` matches; if the sampler has no rows for that address, the run is `error` (`telemetry: no samples for device ...`).
+- **Probe mode:** `sampler --probe <s>` samples every 1 ms and reports per GPU how often `fw_timestamp`, `power_w` and `energy_j` changed (refresh interval of the firmware), the mean read time, and `ΔE/Δt` compared with `power_w` as a check of the energy unit.
 
 ### Hardware counters
 
@@ -489,7 +517,7 @@ agg.OccupancyPercent=wmean
 ### Cutting to the ROI
 
 - All sources are cut using the **monotonic clock** and `roi_*_mono_ns`: telemetry samples by `mono_ns`, kernel starts from rocprofv3 by their start/end timestamps.
-- Telemetry: samples inside the ROI are used for averages; energy is interpolated at the boundaries (see above).
+- Telemetry: samples inside the ROI are used for averages and maxima; counters (energy, residencies) are interpolated at the boundaries (see above). After a run, the wrapper waits (at most 3 intervals + 2 s) for a sample after the ROI end, which the interpolation needs. The rows used are copied to `telemetry_roi.csv` of the run.
 - Counters: kernel starts that lie completely inside the ROI are used.
 - **Consistency check:** the number of kernel starts inside the ROI must equal `iterations` from the benchmark JSON. A mismatch (e.g. because rocprofv3 uses a different clock than assumed) produces a warning and the run is marked in `wrapper.log`.
 
@@ -498,11 +526,15 @@ agg.OccupancyPercent=wmean
 | Field | Source | Meaning |
 |---|---|---|
 | `m_energy_j` | sampler | energy over the ROI (interpolated energy counter) |
-| `m_avg_power_w` | sampler | `m_energy_j / runtime_s` |
-| `m_avg_gfx_clk_mhz`, `m_avg_mem_clk_mhz` | sampler | mean clocks over the ROI |
-| `m_max_temp_c` | sampler | maximum hotspot temperature over the ROI |
+| `m_avg_power_w` | sampler | `m_energy_j / ROI length` |
+| `m_ppt_viol_pct`, `m_thm_viol_pct` | sampler | share of the ROI with power-limit / thermal throttling (interpolated residency counters) |
+| `m_telemetry_samples` | sampler | number of samples inside the ROI |
+| `m_avg_power_sampled_w` | sampler | mean of the sampled `power_w` (for comparison; `m_avg_power_w` is the reliable value) |
+| `m_avg_gfx_clk_mhz`, `m_min_gfx_clk_mhz`, `m_max_gfx_clk_mhz` | sampler | gfx clock over the ROI: mean, lowest and highest XCD clock |
+| `m_avg_mem_clk_mhz` | sampler | mean memory clock over the ROI |
+| `m_max_temp_c`, `m_max_temp_mem_c` | sampler | maximum hotspot and HBM temperature over the ROI |
 | `m_avg_gfx_util_pct`, `m_avg_mem_util_pct` | sampler | mean utilization over the ROI |
-| `m_throttle_pct` | sampler | share of samples with power or thermal throttling |
+| `m_max_read_ms` | sampler | longest read of the metrics table inside the ROI |
 | `m_<COUNTER>` | rocprofv3 | aggregated counter value over the ROI (`sum` or `wmean`) |
 | `m_dispatches` | rocprofv3 | number of kernel starts inside the ROI |
 | `m_kernel_time_s` | rocprofv3 | summed kernel duration inside the ROI |
@@ -513,7 +545,8 @@ Raw data (`telemetry.csv`, `counters.csv`) is always kept; ratios beyond the der
 ### Limitations
 
 - **Infinity Cache:** `rocprofv3` on gfx942 lists no counter block for the Infinity Cache. Hits and misses there cannot be measured directly; only traffic leaving the L2 (`TCC_EA0_*`) is visible. The Infinity Cache level appears only indirectly, e.g. in the latency steps of `chase`.
-- **Sensor update rate:** the power sensor updates and averages internally at its own rate; a shorter sample interval adds no information. The rate is determined once by sampling at 1 ms and counting value changes, and the default interval is chosen accordingly.
+- **Sensor update rate:** the firmware refreshes the metrics table at its own rate; a shorter sample interval adds no information. The rate is measured with `sampler --probe` and the default interval is chosen accordingly (open: measurement on the MI300A).
+- **Socket power:** on the MI300A, `current_socket_power` probably includes the CPU part of the APU (to be confirmed).
 
 ---
 

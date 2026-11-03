@@ -1,2 +1,2 @@
 #!/usr/bin/env bash
-exec "$(dirname "$0")/../mockbench.sh" ok "$@"
+exec "$(dirname "$(readlink -f "$0")")/../mockbench.sh" ok "$@"

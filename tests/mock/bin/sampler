@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# sampler (mock) - imitates tools/sampler.c for the wrapper tests, without a GPU
+#
+# Two GPUs with constant, known values:
+#   0000:01:00.0   400 W, gfx clock 2000 MHz (1900..2100), 25 % power throttling
+#   0000:42:00.0   100 W, gfx clock 1000 MHz
+# The energy counter grows exactly with the power, so energy over any window is exact.
+# Time: mono_ns = Unix time in ns modulo 1e15, the same clock as tests/mock/mockbench.sh.
+#
+# Environment MOCK_SAMPLER (for failure tests):
+#   fail       exit 1 at start, like a failed amdsmi_init
+#   die        exit after about 0.3 s
+#   silent     run, but never write a sample
+#   otherbdf   report only 0000:42:00.0
+#   badheader  write an unexpected header (rows are written as usual)
+
+interval=100 out=/dev/stdout
+while (($#)); do
+    case $1 in
+        --interval-ms) interval=$2; shift 2 ;;
+        --out) out=$2; shift 2 ;;
+        *) echo "sampler: unknown option $1" >&2; exit 1 ;;
+    esac
+done
+mode=${MOCK_SAMPLER:-}
+
+if [[ $mode == fail ]]; then
+    echo "sampler: amdsmi_init: fake error" >&2
+    exit 1
+fi
+
+stop=0
+trap 'stop=1' TERM INT
+pause=$(awk -v i="$interval" 'BEGIN { printf "%.3f", i / 1000 }')
+
+if [[ $mode == badheader ]]; then
+    echo "time,gpu,power" >"$out"
+else
+    echo "mono_ns,unix_ns,bdf,read_ns,fw_timestamp,power_w,energy_j,gfx_clk_mhz,gfx_clk_min_mhz,gfx_clk_max_mhz,mem_clk_mhz,temp_hotspot_c,temp_mem_c,gfx_util_pct,mem_util_pct,acc_counter,ppt_residency_acc,thm_residency_acc" >"$out"
+fi
+echo "sampler (mock): started, interval $interval ms" >&2
+
+start=$(date +%s%N)
+while ((!stop)); do
+    now=$(date +%s%N)
+    el=$((now - start))                       # ns since start
+    mono=$((now % 1000000000000000))
+    ms=$((el / 1000000))
+    if [[ $mode != silent ]]; then
+        # energy in mJ: power [W] * el [ns] / 1e6, written as J with 3 decimals
+        e1=$((1000000000 + 400 * el / 1000000)) e2=$((5000000 + 100 * el / 1000000))
+        # the GPU of the mock benchmarks (0000:01:00.0) comes second, so a wrapper that
+        # does not filter by PCI address picks the wrong values
+        rows="$mono,$now,0000:42:00.0,1000,$ms,100,$((e2 / 1000)).$(printf '%03d' $((e2 % 1000))),1000.0,1000,1000,1300,40,35,0,0,$ms,0,"$'\n'
+        [[ $mode == otherbdf ]] ||
+            rows+="$mono,$now,0000:01:00.0,1000,$ms,400,$((e1 / 1000)).$(printf '%03d' $((e1 % 1000))),2000.0,1900,2100,1300,70,60,100,5,$ms,$((ms / 4)),"$'\n'
+        printf '%s' "$rows" >>"$out"
+    fi
+    if [[ $mode == die ]] && ((el > 300000000)); then
+        echo "sampler (mock): dying" >&2
+        exit 3
+    fi
+    sleep "$pause" &
+    wait $!
+done
+echo "sampler (mock): stopped" >&2
+exit 0

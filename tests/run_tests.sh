@@ -48,10 +48,11 @@ cfg() { printf '%s\n' "$1" >"$CDIR/runs.cfg"; }
 
 # wrapper command with the mocks. Later options override earlier ones,
 # so a test can pass its own --config, --component etc.
+# Telemetry defaults keep the tests fast: no idle baseline, sampler every 20 ms.
 wrap_cmd() {
     WRAP_CMD=("$SUITE/run_suite.sh" --src-dir "$MOCK/src" --bin-dir "$MOCK/bin"
               --component "$MOCK/component.cfg" --config "$CDIR/runs.cfg"
-              --results "$CDIR/results" "$@")
+              --results "$CDIR/results" --idle 0 --sample-interval 20 "$@")
 }
 
 # wrap <args...>: run the wrapper; sets RC and DIR
@@ -159,6 +160,31 @@ csv_value() {
 label_order() {
     awk '{ if (match($0, /"label":"[a-z]"/)) printf "%s", substr($0, RSTART + 9, 1) }' "$DIR/results.jsonl" 2>/dev/null
 }
+
+# check_num <label> <rep> <field> <expected> <tolerance>: numeric field of a run's record
+check_num() {
+    need_dir || return
+    local rec v
+    rec=$(record "$1" "$2")
+    v=$(sed -n "s/.*\"$3\":\([^,}]*\).*/\1/p" <<<"$rec")
+    if [[ -z $v || $v == null ]]; then fail_check "$3 of $1 rep $2 is missing or null"; return; fi
+    awk -v v="$v" -v e="$4" -v t="$5" 'BEGIN { d = v - e; if (d < 0) d = -d; exit !(d <= t) }' ||
+        fail_check "$3 of $1 rep $2 is $v, expected $4 +- $5"
+}
+
+# bin_without_sampler: a bin directory with all mocks except the sampler; prints its path
+bin_without_sampler() {
+    local f
+    mkdir -p "$CDIR/bin"
+    for f in "$MOCK"/bin/*; do
+        [[ $(basename "$f") == sampler ]] || ln -s "$f" "$CDIR/bin/"
+    done
+    printf '%s' "$CDIR/bin"
+}
+
+# sampler_running: is a sampler of this test run still alive? Matches only samplers that
+# write into $TMP, so it never hits other processes (or the shell that runs the tests).
+sampler_running() { pgrep -f "[s]ampler --interval-ms [0-9]+ --out $TMP/" >/dev/null; }
 
 run_test() {
     local name=$1 f
@@ -731,6 +757,190 @@ test_no_aggregation_without_repeat() {
 }
 
 # ===========================================================================
+# Telemetry (mock sampler: 0000:01:00.0 = 400 W, 2000 MHz, 25 % power throttling;
+#                          0000:42:00.0 = 100 W, 1000 MHz)
+# ===========================================================================
+
+# telemetry_run [args]: one run of mock_ok (PCI address 0000:01:00.0) in production mode
+telemetry_run() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode production --duration 0.4 --pause 0 "$@"
+}
+
+register telemetry_energy_and_power_over_roi
+test_telemetry_energy_and_power_over_roi() {
+    telemetry_run
+    check_rc 0
+    check_status a 1 ok
+    check_num a 1 m_avg_power_w 400 4
+    check_num a 1 m_energy_j 160 5          # 400 W x ~0.4 s
+}
+
+register telemetry_uses_the_gpu_of_the_run
+test_telemetry_uses_the_gpu_of_the_run() {
+    telemetry_run
+    check_num a 1 m_avg_gfx_clk_mhz 2000 0.5  # the other GPU has 1000 MHz
+    check_num a 1 m_max_temp_c 70 0
+    need_dir || return
+    check_csv "$DIR/results.csv" 1           # the record is still one valid JSON line
+}
+
+register telemetry_throttling_share
+test_telemetry_throttling_share() {
+    telemetry_run
+    check_num a 1 m_ppt_viol_pct 25 2
+    check_record a 1 '"m_thm_viol_pct":null'
+}
+
+register telemetry_samples_counted
+test_telemetry_samples_counted() {
+    telemetry_run
+    check_num a 1 m_telemetry_samples 20 12     # ~0.4 s / 20 ms; the bash mock is not exact
+}
+
+register telemetry_roi_rows_written
+test_telemetry_roi_rows_written() {
+    telemetry_run
+    need_dir || return
+    local f=$DIR/runs/a/rep1/pass0/telemetry_roi.csv
+    check_exists "$f"
+    [[ -f $f ]] || return
+    check_contains "$f" "mono_ns,unix_ns,bdf"
+    check_not_contains "$f" "0000:42:00.0"
+    local res
+    res=$(awk -F, -v s="$(sed -n 's/.*"roi_start_mono_ns":\([0-9]*\).*/\1/p' "$DIR/results.jsonl")" \
+              -v e="$(sed -n 's/.*"roi_end_mono_ns":\([0-9]*\).*/\1/p' "$DIR/results.jsonl")" '
+        NR == 2 { first = $1 } NR > 1 { last = $1 }
+        END { if (NR < 3) print "too few rows"; else if (first > s) print "first row after ROI start";
+              else if (last < e) print "last row before ROI end" }' "$f")
+    [[ -z $res ]] || fail_check "telemetry_roi.csv: $res"
+}
+
+register telemetry_device_not_seen_is_error
+test_telemetry_device_not_seen_is_error() {
+    MOCK_SAMPLER=otherbdf telemetry_run
+    check_rc 4
+    check_status a 1 error
+    check_record a 1 "telemetry: no samples for device 0000:01:00.0 (sampler sees: 0000:42:00.0)"
+}
+
+register telemetry_in_aggregates
+test_telemetry_in_aggregates() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode production --duration 0.2 --pause 0 --repeat 2
+    need_dir || return
+    local v
+    v=$(csv_value "$DIR/aggregates.csv" '"a"' m_avg_power_w_mean)
+    awk -v v="$v" 'BEGIN { exit !(v > 396 && v < 404) }' || fail_check "m_avg_power_w_mean is '$v', expected ~400"
+}
+
+register idle_baseline_per_gpu
+test_idle_baseline_per_gpu() {
+    telemetry_run --idle 0.3
+    check_rc 0
+    need_dir || return
+    check_csv "$DIR/idle/idle.csv" 2
+    check_contains "$DIR/idle/idle.csv" '"0000:42:00.0"'
+    check_contains "$CDIR/err" "0000:01:00.0  power 400.0 W"
+}
+
+register no_idle_baseline_with_idle_0
+test_no_idle_baseline_with_idle_0() {
+    telemetry_run --idle 0
+    need_dir || return
+    check_absent "$DIR/idle"
+}
+
+register check_mode_needs_no_sampler
+test_check_mode_needs_no_sampler() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode check --bin-dir "$(bin_without_sampler)"
+    check_rc 0
+    need_dir || return
+    check_absent "$DIR/telemetry.csv"
+}
+
+register missing_sampler_rejected
+test_missing_sampler_rejected() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode production --bin-dir "$(bin_without_sampler)"
+    check_rejected "telemetry: sampler '$CDIR/bin/sampler' not found or not executable"
+}
+
+register invalid_sample_interval
+test_invalid_sample_interval() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode production --sample-interval 0
+    check_rejected "--sample-interval must be an integer between 1 and 60000"
+}
+
+register sampler_start_failure_aborts
+test_sampler_start_failure_aborts() {
+    MOCK_SAMPLER=fail telemetry_run
+    check_rc 1
+    check_contains "$CDIR/err" "sampler exited at start (exit 1): sampler: amdsmi_init: fake error"
+    need_dir || return
+    check_exists "$DIR/sampler.log"
+    check_absent "$DIR/runs/a"
+}
+
+register sampler_without_samples_aborts
+test_sampler_without_samples_aborts() {
+    MOCK_SAMPLER=silent telemetry_run         # takes the start timeout (5 s)
+    check_rc 1
+    check_contains "$CDIR/err" "no telemetry from the sampler after 5 s"
+    sampler_running && fail_check "sampler still running"
+}
+
+register sampler_bad_header_aborts
+test_sampler_bad_header_aborts() {
+    MOCK_SAMPLER=badheader telemetry_run
+    check_rc 1
+    check_contains "$CDIR/err" "unexpected header"
+}
+
+register sampler_death_stops_the_suite
+test_sampler_death_stops_the_suite() {
+    cfg "a  mock_ok  --duration {DURATION}
+b  mock_ok  --duration {DURATION}
+c  mock_ok  --duration {DURATION}"
+    MOCK_SAMPLER=die wrap --mode production --duration 0.3 --pause 0
+    check_rc 4
+    check_contains "$CDIR/err" "the sampler stopped unexpectedly; remaining runs were not executed"
+    need_dir || return
+    local n
+    n=$(awk 'END { print NR }' "$DIR/results.jsonl")
+    ((n < 3)) || fail_check "all $n runs executed"
+}
+
+register sampler_stopped_after_the_runs
+test_sampler_stopped_after_the_runs() {
+    telemetry_run
+    check_rc 0
+    sleep 0.2
+    sampler_running && { fail_check "sampler still running"; pkill -f "[s]ampler --interval-ms [0-9]+ --out $TMP/"; }
+    need_dir || return
+    check_contains "$DIR/sampler.log" "stopped"
+}
+
+register sampler_stopped_on_sigterm
+test_sampler_stopped_on_sigterm() {
+    local pid
+    cfg "h  mock_hang  --duration {DURATION}"
+    wrap_cmd --mode production --duration 1 --pause 0
+    "${WRAP_CMD[@]}" >"$CDIR/out" 2>"$CDIR/err" &
+    pid=$!
+    sleep 1.5
+    kill -TERM "$pid"
+    wait "$pid"
+    RC=$?
+    check_rc 5
+    sleep 0.3
+    sampler_running && { fail_check "sampler still running"; pkill -f "[s]ampler --interval-ms [0-9]+ --out $TMP/"; }
+    pkill -fx "sleep 100000"
+}
+
+# ===========================================================================
 # Dry run and help
 # ===========================================================================
 
@@ -767,16 +977,23 @@ test_help_shows_benchmark_parameters() {
 # build.sh (with a fake compiler that records its arguments)
 # ===========================================================================
 
-# build <names...>: run build.sh with the fake compiler; sets RC
+# build <names...>: run build.sh with fake compilers (hipcc for the benchmarks, cc for
+# the sampler) that log their arguments to <name>.log, and a fake ROCm directory that
+# contains amdsmi.h; sets RC. Overrides for a single test: BUILD_HIPCC, BUILD_ROCM.
 build() {
-    mkdir -p "$CDIR/fakebin"
-    cat >"$CDIR/fakebin/hipcc" <<'EOF'
+    local c
+    mkdir -p "$CDIR/fakebin" "$CDIR/rocm/include/amd_smi"
+    : >"$CDIR/rocm/include/amd_smi/amdsmi.h"
+    for c in hipcc cc; do
+        cat >"$CDIR/fakebin/$c" <<'EOF'
 #!/usr/bin/env bash
-echo "$*" >>"${FAKE_LOG:?}"
+echo "$*" >>"${FAKE_LOG_DIR:?}/$(basename "$0").log"
 while (($#)); do [[ $1 == -o ]] && { : >"$2"; chmod +x "$2"; }; shift; done
 EOF
-    chmod +x "$CDIR/fakebin/hipcc"
-    FAKE_LOG=$CDIR/hipcc.log HIPCC=$CDIR/fakebin/hipcc "$SUITE/build.sh" --src-dir "$MOCK/src" \
+        chmod +x "$CDIR/fakebin/$c"
+    done
+    FAKE_LOG_DIR=$CDIR HIPCC=${BUILD_HIPCC:-$CDIR/fakebin/hipcc} CC=$CDIR/fakebin/cc \
+        ROCM_PATH=${BUILD_ROCM:-$CDIR/rocm} "$SUITE/build.sh" --src-dir "$MOCK/src" \
         --bin-dir "$CDIR/build" --component "$MOCK/component.cfg" "$@" >"$CDIR/out" 2>"$CDIR/err"
     RC=$?
 }
@@ -795,6 +1012,32 @@ test_build_skips_invalid_metadata() {
     check_rc 1
     check_exists "$CDIR/build/mock_ok"
     check_absent "$CDIR/build/mock_badmeta"
+}
+
+register build_sampler_against_amdsmi
+test_build_sampler_against_amdsmi() {
+    BUILD_HIPCC=/nonexistent/hipcc build sampler     # the sampler must not need hipcc
+    check_rc 0
+    check_exists "$CDIR/build/sampler"
+    check_contains "$CDIR/cc.log" "$SUITE/tools/sampler.c"
+    check_contains "$CDIR/cc.log" "-I$CDIR/rocm/include"
+    check_contains "$CDIR/cc.log" "-lamd_smi"
+}
+
+register build_sampler_without_amdsmi_fails
+test_build_sampler_without_amdsmi_fails() {
+    mkdir -p "$CDIR/empty"
+    BUILD_ROCM=$CDIR/empty build sampler
+    check_rc 1
+    check_contains "$CDIR/err" "amdsmi.h not found"
+    check_absent "$CDIR/build/sampler"
+}
+
+register build_all_includes_sampler
+test_build_all_includes_sampler() {
+    build                     # no names: all benchmarks and the sampler
+    check_exists "$CDIR/build/sampler"
+    check_exists "$CDIR/build/mock_ok"
 }
 
 # ===========================================================================
