@@ -28,7 +28,8 @@ the literature-based justification of the selection.
 - **Aggregation over kernel starts:** counts are summed (`sum`); the formulas are ratios or
   latencies and are weighted by kernel duration (`wmean`), see the wish list.
 
-Selected: 78 counters (48 hardware, 22 sums over instances, 8 formulas).
+Selected: 72 counters (48 hardware, 22 sums over instances, 2 formulas). Six further formulas
+were considered and left out (see below).
 
 ## Expected signatures of the current benchmarks
 
@@ -177,18 +178,18 @@ Traffic leaving the L2 towards the Infinity Fabric: read and write requests by s
 
 ## Derived quantities (rocprofv3)
 
-Formulas evaluated by rocprofv3 for readable results. `MeanOccupancyPerCU` and `VmemLatency` are based on `accumulate(...)` counters and can only be obtained this way; the others could also be computed in the analysis from the counters above.
+Formulas evaluated by rocprofv3. Only `MeanOccupancyPerCU` and `VmemLatency` are collected: they are based on `accumulate(...)` counters and can only be obtained this way. The other six (marked *not collected*) are plain formulas of counters that are collected anyway; requesting them would occupy counter registers (more passes) for values the analysis computes itself. They are listed as a reference for the analysis.
 
 | Counter | Kind | Description (rocprofv3) | rocprof-compute panels |
 |---|---|---|---|
-| `VALUBusy` | formula | The percentage of GPUTime vector ALU instructions are processed. Value range: 0% (bad) to 100% (optimal). | - |
-| `VALUUtilization` | formula | The percentage of active vector ALU threads in a wave. A lower number can mean either more thread divergence in a wave or that the work-g... | - |
-| `FETCH_SIZE` | formula | The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into acc... | - |
-| `WRITE_SIZE` | formula | The total kilobytes written to the video memory. This is measured with all extra fetches and any cache or memory effects taken into account. | - |
+| `VALUBusy` | formula, *not collected* | The percentage of GPUTime vector ALU instructions are processed. Value range: 0% (bad) to 100% (optimal). | - |
+| `VALUUtilization` | formula, *not collected* | The percentage of active vector ALU threads in a wave. A lower number can mean either more thread divergence in a wave or that the work-g... | - |
+| `FETCH_SIZE` | formula, *not collected* | The total kilobytes fetched from the video memory. This is measured with all extra fetches and any cache or memory effects taken into acc... | - |
+| `WRITE_SIZE` | formula, *not collected* | The total kilobytes written to the video memory. This is measured with all extra fetches and any cache or memory effects taken into account. | - |
 | `MeanOccupancyPerCU` | formula | Mean occupancy per compute unit. | - |
 | `VmemLatency` | formula | Unit: cycles | - |
-| `OccupancyPercent` | formula | GPU Occupancy as % of maximum. | - |
-| `MfmaUtil` | formula | reduce(SQ_VALU_MFMA_BUSY_CYCLES,sum)/(reduce(GRBM_GUI_ACTIVE,max)*SIMD_NUM)*100 (percent) | - |
+| `OccupancyPercent` | formula, *not collected* | GPU Occupancy as % of maximum. | - |
+| `MfmaUtil` | formula, *not collected* | reduce(SQ_VALU_MFMA_BUSY_CYCLES,sum)/(reduce(GRBM_GUI_ACTIVE,max)*SIMD_NUM)*100 (percent) | - |
 
 ## Open points
 
@@ -199,6 +200,6 @@ Formulas evaluated by rocprofv3 for readable results. `MeanOccupancyPerCU` and `
   the counters used in power and performance models (e.g. Guerreiro et al., AccelWattch) and reduced
   or extended accordingly; the PCA on validation data can show which counters are redundant.
 - **Infinity Cache:** no counter block on gfx942 (contract section 13, limitations).
-- **Formulas vs. own computation:** `FETCH_SIZE`, `WRITE_SIZE`, `VALUBusy`, `VALUUtilization`,
-  `OccupancyPercent` can be computed in the analysis from collected counters; requesting them from
-  rocprofv3 is a convenience for users of the suite.
+- **Formulas in the analysis:** the six formulas that are not collected must be reproduced in the
+  analysis with the definitions of `rocprofv3 --list-avail` (e.g. `MfmaUtil` above); constants such
+  as `SIMD_NUM` or `CU_NUM` are listed there as well.

@@ -1,5 +1,5 @@
 status: draft
-version: 0.7.1
+version: 0.8.0
 
 # Benchmark Contract and Wrapper Interfaces
 
@@ -26,10 +26,11 @@ suite/
     build/                     built binaries (generated, not versioned)
     tools/
         sampler.c              telemetry sampler (Section 13)
-        plan_counter_passes.sh generates the counter config (Section 13)       [not implemented yet]
+        plan_counter_passes.sh generates the counter config (Section 13)
     config/
         component.cfg          component config (Section 8)
-        counters_<arch>.cfg    counter config (Section 13)                       [not implemented yet]
+        counters_wishlist_<arch>.cfg  wished counters, input of the pass planner (Section 13)
+        counters_<arch>.cfg    counter config: counters per pass (Section 13, generated)
         runs.cfg               run config (Section 9)
     results/                   result directories (generated, not versioned)
     tests/                     tests of wrapper and build script with mock benchmarks (no GPU needed)
@@ -302,12 +303,14 @@ results/<YYYYmmdd-HHMMSS>_<mode>/
     telemetry.csv          raw sampler output for all GPUs over the whole invocation (Section 13)
     sampler.log            stderr of the sampler
     idle/idle.csv          idle baseline, one row per GPU (Section 12, phase 6)
+    counters.csv           hardware counters cut to the ROI, one row per run, pass and counter (validation mode, Section 13)
     runs/<label>/rep<i>/pass<k>/
         command.txt        exact invocation incl. environment (e.g. HIP_VISIBLE_DEVICES=0 ./fma --duration 30 ...)
-        stdout.json        raw benchmark output
-        stderr.log         benchmark stderr
-        telemetry_roi.csv  telemetry rows of the run's GPU covering the ROI (from the last sample before to the first after it)
-        counters.csv       raw rocprofv3 output, per kernel start (passes k >= 1, validation mode only)
+        stdout.json        raw benchmark output (in passes k >= 1: the JSON line extracted from stdout_raw.log)
+        stderr.log         benchmark stderr (in passes k >= 1: also the profiler's messages)
+        telemetry_roi.csv  telemetry rows of the run's GPU covering the ROI (pass 0; from the last sample before to the first after it)
+        stdout_raw.log     complete stdout under the profiler, incl. its log lines (passes k >= 1)
+        rocprof/           raw rocprofv3 output, one row per kernel start and counter (passes k >= 1)
 ```
 
 Run directories are created only for executed runs (not for runs filtered by the precision filter). In `check` and `production` mode there is only `pass0`. In `validation` mode, `pass0` is the run without profiler and `pass1` … `pass<k>` are the counter passes (Section 13).
@@ -393,6 +396,9 @@ Selected with `--mode check|validation|production`.
 | `--timeout <s>` | Per-run timeout (default `duration × 2 + 60 s`) |
 | `--sample-interval <ms>` | Telemetry sampling interval (default 100; 1 to 60000) |
 | `--idle <s>` | Duration of the idle baseline (default 5; 0 disables it) |
+| `--counters <file>` | Counter config (default `config/counters_<arch>.cfg`; `validation` only) |
+| `--rocprof <cmd>` | Profiler command (default `rocprofv3`) |
+| `--profile-duration <s>` | `--duration` of the benchmark in the counter passes (default 2; replaces the run's `--duration` there) |
 | `--results <dir>` | Where result directories are created (default `results/`) |
 | `--src-dir <dir>`, `--bin-dir <dir>` | Benchmark sources and binaries (default `src/`, `build/`); used by the tests |
 | `--dry-run` | Stop after the plan (phase 4) |
@@ -402,11 +408,11 @@ Selected with `--mode check|validation|production`.
 
 1. **Arguments:** parse and check the wrapper options.
 2. **Load:** component config, run config, metadata of every referenced benchmark.
-3. **Validate (no GPU):** component config, run config syntax, unique labels, metadata, benchmark source and binary exist, sampler binary exists (not in `check` mode), `--duration` present, precision filter (filtered runs become `skipped`, not an error), `--check` for every run. In `check` mode additionally: every documented parameter default (`param.*`) is accepted by `--check`. **All** errors are collected and reported together; if there is any, the wrapper exits without starting a run.
-4. **Plan:** substitute `{DURATION}`, assign devices, form the run list (rounds × runs). Print the plan and the estimated total duration (runs + pauses + idle baseline), to help choosing the Slurm time limit.
+3. **Validate (no GPU):** component config, run config syntax, unique labels, metadata, benchmark source and binary exist, sampler binary exists (not in `check` mode), in `validation` mode the counter config (passes numbered 1…K without gaps, valid counter names, no counter twice, `agg` is `sum` or `wmean`) and the profiler, `--duration` present, precision filter (filtered runs become `skipped`, not an error), `--check` for every run. In `check` mode additionally: every documented parameter default (`param.*`) is accepted by `--check`. **All** errors are collected and reported together; if there is any, the wrapper exits without starting a run.
+4. **Plan:** substitute `{DURATION}`, assign devices, form the run list (rounds × runs). Print the plan and the estimated total duration (runs + pauses + idle baseline + counter passes), to help choosing the Slurm time limit.
 5. **Prepare:** create the result directory, copy configs and sources, start the sampler (not in `check` mode) and wait for its first sample (Section 13).
 6. **Idle baseline:** `--idle` seconds without load (not in `check` mode), summarized per GPU in `idle/idle.csv` and printed, as reference (e.g. idle power per GPU). The wrapper has no monotonic clock, so this window is cut by `unix_ns`.
-7. **Execute:** for each run and each pass: start benchmark (in passes k >= 1 under rocprofv3) → evaluate (exit code, JSON, required fields) → cut telemetry and counters to the ROI → after the last pass: merge passes, append to `results.jsonl`, rewrite `results.csv`, print TSV row → pause.
+7. **Execute:** for each run: pass 0 (benchmark without profiler → evaluate exit code, JSON, required fields → cut telemetry to the ROI) → in `validation` mode, if pass 0 is `ok` or `invalid`: passes 1…K under rocprofv3 (each checked like pass 0, counters cut to the ROI of that pass) → append the counter rows of all passes to `counters.csv` → append the record to `results.jsonl`, rewrite `results.csv`, print TSV row → pause. There is no pause between the passes of one run.
 8. **Finish:** stop the sampler, aggregation (with `--repeat > 1`), final tables, wrapper exit code.
 
 ### Repetitions and order
@@ -418,6 +424,7 @@ Selected with `--mode check|validation|production`.
 
 - **Timeout:** a run gets SIGTERM after `duration × 2 + 60 s` (or `--timeout`) and SIGKILL 10 s later; status `timeout`, continue with the next run.
 - **Failed run:** logged with its status, continue with the next run.
+- **Failed counter pass:** profiler error, contract violation, missing output file, a requested counter missing in the output or no kernel start inside the ROI make the run `error` (reason `counters: pass <k>: ...`). Its counter rows are not written (no partially profiled runs in `counters.csv`); pass 0 data stays in the record.
 - **Incremental results:** every run is written immediately, nothing is held back until the end.
 - **Abort (`SIGTERM`/`SIGINT`, e.g. Slurm time limit):** the wrapper stops the running benchmark and the sampler, notes the abort in `wrapper.log` and exits. All completed runs are preserved.
 - **Sampler fails:** if it exits at start, writes no sample within 5 s or writes an unexpected header, the wrapper stops before the first run (exit 1). If it stops during the runs, the remaining runs are not executed (exit 4): measurements without telemetry are worthless in `production`.
@@ -484,7 +491,8 @@ sampler --probe <seconds> [--interval-ms <n>]    measure how often the values ar
 - Collected with `rocprofv3` in dispatch mode (per kernel start). This requires the profiler inside the benchmark process; reimplementing this is out of scope.
 - **Passes in `validation` mode:**
   - **Pass 0:** benchmark without profiler, telemetry only. Telemetry in the results comes from this pass only, because the profiler serializes kernel starts and inserts gaps, which changes power and clocks.
-  - **Passes 1…k:** benchmark under `rocprofv3`, one counter set per pass. The sampler keeps running, but its data from these passes is not used for results.
+  - **Passes 1…k:** benchmark under `rocprofv3`, one counter set per pass, with `--duration` replaced by `--profile-duration` (default 2 s): counter values are sums over kernel starts and do not need a long run, and the profiler output grows with every kernel start. The sampler keeps running, but its data from these passes is not used for results.
+  - Invocation per pass: `HIP_VISIBLE_DEVICES=<n> rocprofv3 --pmc <counters> --output-format csv -d runs/.../pass<k>/rocprof -- <benchmark> <args>`. The profiler may print log lines on stdout; the JSON line is the last line starting with `{`.
   - Merging relies on deterministic benchmarks (Section 6).
 - **Counter types:**
   - *Hardware counters* (`Block:` in `rocprofv3 --list-avail`): occupy hardware counter registers; their combination determines the number of passes.
@@ -505,21 +513,42 @@ agg.VALUBusy=wmean
 agg.OccupancyPercent=wmean
 ```
 
-- `pass.<k>`: comma-separated counters collected together in pass `k`.
+- `pass.<k>`: comma-separated counters collected together in pass `k`; passes are numbered 1…K without gaps, every counter appears in one pass only.
 - `agg.<counter>`: aggregation over kernel starts. `sum` (default) for quantities (counts, kilobytes); `wmean` (mean weighted by kernel duration) for ratios and rates (percentages, latencies, occupancy).
+- Derived counters that are plain formulas of other collected counters (e.g. `VALUBusy`, `FETCH_SIZE`) are not collected: they cost register space and are computed in the analysis from the raw counters. Only derived counters that cannot be computed afterwards (based on `accumulate(...)`: `MeanOccupancyPerCU`, `VmemLatency`) are in the wish list.
 
 ### Pass planner (`tools/plan_counter_passes.sh`)
 
-- Input: a wish list of counters with their aggregation type.
-- Packs counters greedily into passes and tests each candidate pass with `rocprofv3` on a small test kernel; if rocprofv3 rejects the combination, a new pass is started.
-- Writes `counters_<arch>.cfg`. On a new system the file is regenerated with one call (Q1, Q2).
+- Input: the wish list `config/counters_wishlist_<arch>.cfg` (`want.<group>=<c1>,<c2>,...` and `agg.<counter>=sum|wmean`); the groups only structure the list.
+- Packs counters greedily into passes in the order of the wish list and tests each candidate pass with `rocprofv3` on a short test run (default `build/fma --duration 0.001`): a candidate is accepted if the profiler exits with 0 and its output contains every requested counter; otherwise a new pass is started. A counter rejected even alone is skipped with a warning and listed in the header of the output.
+- Writes `counters_<arch>.cfg` (passes + the `agg` lines of the wish list). On a new system the file is regenerated with one call on a GPU node (Q1, Q2): `tools/plan_counter_passes.sh` (options `--wishlist`, `--out`, `--rocprof`, `--device`, `--test-command`).
 
 ### Cutting to the ROI
 
 - All sources are cut using the **monotonic clock** and `roi_*_mono_ns`: telemetry samples by `mono_ns`, kernel starts from rocprofv3 by their start/end timestamps.
 - Telemetry: samples inside the ROI are used for averages and maxima; counters (energy, residencies) are interpolated at the boundaries (see above). After a run, the wrapper waits (at most 3 intervals + 2 s) for a sample after the ROI end, which the interpolation needs. The rows used are copied to `telemetry_roi.csv` of the run.
-- Counters: kernel starts that lie completely inside the ROI are used.
-- **Consistency check:** the number of kernel starts inside the ROI must equal `iterations` from the benchmark JSON. A mismatch (e.g. because rocprofv3 uses a different clock than assumed) produces a warning and the run is marked in `wrapper.log`.
+- Counters: kernel starts that lie completely inside the ROI of the same pass are used (warmup kernels before the ROI and verification kernels after it are left out).
+- **Consistency check:** if no kernel start lies inside the ROI, the profiler timestamps are not on the monotonic clock (or the benchmark's ROI is wrong); the run is `error`. If the number of kernel starts differs from `iterations`, this is noted in `wrapper.log` only, because a benchmark may start more than one kernel per iteration; both numbers are in `counters.csv`.
+
+### `counters.csv`
+
+Long format: one row per run, repetition, pass and counter, written in validation mode. It is a separate file because the counter set depends on the system, and so the results table keeps the same columns with and without counters. The analysis joins it with `results.csv` by `label` and `rep`.
+
+| Column | Meaning |
+|---|---|
+| `label`, `rep`, `benchmark`, `benchmark_version`, `device` | as in `results.csv` |
+| `pass` | pass number `k` (1…K) |
+| `counter` | counter name as in the counter config |
+| `value` | aggregated over the kernel starts inside the ROI: sum, or for `agg=wmean` the mean weighted by kernel duration |
+| `agg` | `sum` or `wmean` |
+| `dispatches` | kernel starts inside the ROI of this pass |
+| `iterations` | `iterations` of the benchmark in this pass |
+| `kernel_time_s` | summed kernel duration inside the ROI of this pass |
+| `roi_s` | ROI length of this pass |
+
+Values are raw: no normalization per second or per iteration. Since passes run separately, `dispatches` and `iterations` can differ between passes; values of different passes are compared after dividing by `iterations` (or `kernel_time_s`).
+
+These rows are the **ROI view**: only kernel starts inside the ROI. A **job view** over the whole benchmark process (including setup, warmup and verification) is planned (Section 15); the raw profiler output in `rocprof/` already contains all kernel starts.
 
 ### Measured fields (`m_*`)
 
@@ -535,12 +564,9 @@ agg.OccupancyPercent=wmean
 | `m_max_temp_c`, `m_max_temp_mem_c` | sampler | maximum hotspot and HBM temperature over the ROI |
 | `m_avg_gfx_util_pct`, `m_avg_mem_util_pct` | sampler | mean utilization over the ROI |
 | `m_max_read_ms` | sampler | longest read of the metrics table inside the ROI |
-| `m_<COUNTER>` | rocprofv3 | aggregated counter value over the ROI (`sum` or `wmean`) |
-| `m_dispatches` | rocprofv3 | number of kernel starts inside the ROI |
-| `m_kernel_time_s` | rocprofv3 | summed kernel duration inside the ROI |
-| `m_prof_slowdown_p<k>` | wrapper | time per kernel start in pass `k` divided by that of pass 0 (`runtime_s / iterations`); 1.0 means no profiler overhead |
+| `m_prof_slowdown_p<k>` | wrapper | time per iteration in pass `k` divided by that of pass 0 (`runtime_s / iterations`); 1.0 means no profiler overhead (validation mode) |
 
-Raw data (`telemetry.csv`, `counters.csv`) is always kept; ratios beyond the derived counters are computed in the analysis, not in the wrapper.
+Hardware counters are not `m_*` fields but rows of `counters.csv` (see above). Raw data (`telemetry.csv`, `rocprof/`) is always kept; ratios are computed in the analysis, not in the wrapper.
 
 ### Limitations
 
@@ -572,4 +598,5 @@ Help texts are generated from the metadata, so there is one source and benchmark
 - **Auto-generated component config:** read `arch`, `gpus`, precisions and cache sizes from the system (e.g. `rocminfo`, `amd-smi`).
 - **Derived parameters:** working set sizes for memory benchmarks derived from the cache sizes in the component config.
 - **Counter expectations:** format of `expect_counters`, once the counter selection is defined.
+- **Job view of counters and telemetry:** in addition to the ROI view, the whole benchmark process (setup, warmup, ROI, verification) as phases, from the same raw data (`rocprof/`, `telemetry.csv`); see `views_and_phases.md`.
 - **CPU benchmarks** (R7): same contract, device selection via thread count and pinning instead of `HIP_VISIBLE_DEVICES`.

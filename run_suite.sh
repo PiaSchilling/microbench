@@ -4,8 +4,8 @@
 # Specification: docs/benchmark_contract.md (sections 9-14)
 # Implemented:   modes, run/component config, metadata, validation, plan,
 #                execution, contract check, results (JSONL/CSV/TSV), repetitions,
-#                aggregation, timeout, signal handling, help, telemetry (sampler)
-# Not yet:       hardware counters (rocprofv3 passes) - validation runs only pass 0
+#                aggregation, timeout, signal handling, help, telemetry (sampler),
+#                hardware counters (rocprofv3 passes, validation mode)
 
 set -uo pipefail
 
@@ -47,6 +47,12 @@ HELP_BENCH=""
 DO_LIST=0
 SAMPLE_INTERVAL=100     # ms between two telemetry samples (--sample-interval)
 IDLE_SECONDS=5          # idle baseline before the first run (--idle)
+COUNTERS_FILE=""        # counter passes (--counters; default config/counters_<arch>.cfg)
+ROCPROF=rocprofv3       # profiler command (--rocprof)
+PROFILE_DURATION=2      # --duration of the benchmark in counter passes (--profile-duration)
+PASS_SETS=()            # PASS_SETS[k-1] = counters of pass k, comma separated
+WMEAN=""                # counters aggregated as duration-weighted mean, comma separated
+NCOUNTERS=0
 
 # run table (index = position in the run config)
 RUN_LABEL=() RUN_BENCH=() RUN_ARGS=() RUN_LINE=()
@@ -83,7 +89,8 @@ Modes:
                comply with the contract? (no monitoring)
   validation   medium duration, telemetry + hardware counters
   production   long duration, telemetry only
-  (hardware counters are not implemented yet; validation runs telemetry only)
+  In validation mode every run is repeated once per counter pass (pass 1..K)
+  under rocprofv3; the counters of the ROI are written to counters.csv.
 
 Options:
   --config <file>       run config                (default: config/runs.cfg)
@@ -98,6 +105,10 @@ Options:
   --timeout <s>         per-run timeout           (default: duration x $TIMEOUT_FACTOR + $TIMEOUT_OFFSET)
   --sample-interval <ms> telemetry interval       (default: $SAMPLE_INTERVAL; validation/production)
   --idle <s>            idle baseline before the first run (default: $IDLE_SECONDS; 0: none)
+  --counters <file>     counter passes            (default: config/counters_<arch>.cfg; validation)
+                        create it with tools/plan_counter_passes.sh
+  --rocprof <cmd>       profiler                  (default: $ROCPROF)
+  --profile-duration <s> --duration of the benchmark in each counter pass (default: $PROFILE_DURATION)
   --dry-run             validate and print the plan, run nothing
   --results <dir>       where result directories are created (default: results/)
   --src-dir <dir>       benchmark sources         (default: src/)
@@ -189,6 +200,8 @@ json_str() {
     printf '"%s"' "$s"
 }
 
+csv_str() { local s=${1//\"/\"\"}; printf '"%s"' "$s"; }
+
 fmt_secs() {
     awk -v s="$1" 'BEGIN {
         s = int(s + 0.5); h = int(s / 3600); m = int((s % 3600) / 60); r = s % 60
@@ -217,6 +230,9 @@ parse_args() {
             --timeout)   optval "$@"; OPT_TIMEOUT=$2; shift 2 ;;
             --sample-interval) optval "$@"; SAMPLE_INTERVAL=$2; shift 2 ;;
             --idle)      optval "$@"; IDLE_SECONDS=$2; shift 2 ;;
+            --counters)  optval "$@"; COUNTERS_FILE=$2; shift 2 ;;
+            --rocprof)   optval "$@"; ROCPROF=$2; shift 2 ;;
+            --profile-duration) optval "$@"; PROFILE_DURATION=$2; shift 2 ;;
             --results)   optval "$@"; RESULTS_ROOT=$2; shift 2 ;;
             --src-dir)   optval "$@"; SRC_DIR=$2; shift 2 ;;
             --bin-dir)   optval "$@"; BIN_DIR=$2; shift 2 ;;
@@ -256,6 +272,8 @@ parse_args() {
     [[ $SAMPLE_INTERVAL =~ ^[1-9][0-9]*$ ]] && ((SAMPLE_INTERVAL <= 60000)) ||
         die "--sample-interval must be an integer between 1 and 60000 (ms)"
     is_number "$IDLE_SECONDS" || die "--idle must be a number >= 0"
+    { is_number "$PROFILE_DURATION" && positive "$PROFILE_DURATION"; } ||
+        die "--profile-duration must be a positive number"
 
     DURATION=${OPT_DURATION:-${MODE_DURATION[$MODE]}}
     PAUSE=${OPT_PAUSE:-${MODE_PAUSE[$MODE]}}
@@ -464,6 +482,64 @@ check_param_defaults() {
     done
 }
 
+# counter passes (validation mode, contract section 13)
+profiling() { [[ $MODE == validation ]]; }
+
+# load_counters: read the counter config into PASS_SETS and WMEAN
+load_counters() {
+    local f=${COUNTERS_FILE:-$SUITE_DIR/config/counters_${COMP[arch]:-unknown}.cfg} k c n
+    local hint="create it on a GPU node with tools/plan_counter_passes.sh, or pass --counters"
+    local -A cfg=() seen=()
+    local -a ord=() list
+    COUNTERS_FILE=$(abspath "$f")
+    if [[ ! -r $COUNTERS_FILE ]]; then
+        add_error "counters: cannot read '$COUNTERS_FILE' ($hint)"
+        return
+    fi
+    kv_parse cfg ord "$COUNTERS_FILE" <"$COUNTERS_FILE"
+    for k in "${ord[@]}"; do
+        case $k in
+            pass.*)
+                n=${k#pass.}
+                if [[ ! $n =~ ^[1-9][0-9]*$ ]]; then
+                    add_error "counters: $COUNTERS_FILE: invalid key '$k' (pass.<1..K>)"; continue
+                fi
+                IFS=, read -r -a list <<<"${cfg[$k]}"
+                PASS_SETS[n - 1]=""
+                for c in "${list[@]}"; do
+                    trim c
+                    [[ -z $c ]] && continue
+                    if [[ ! $c =~ ^[A-Za-z0-9_]+$ ]]; then
+                        add_error "counters: $COUNTERS_FILE: invalid counter name '$c' in $k"; continue
+                    fi
+                    if [[ -v seen[$c] ]]; then
+                        add_error "counters: $COUNTERS_FILE: counter $c appears in two passes"; continue
+                    fi
+                    seen[$c]=1
+                    NCOUNTERS=$((NCOUNTERS + 1))
+                    PASS_SETS[n - 1]+="${PASS_SETS[n - 1]:+,}$c"
+                done
+                [[ -n ${PASS_SETS[n - 1]} ]] || add_error "counters: $COUNTERS_FILE: $k has no counters" ;;
+            agg.*)
+                case ${cfg[$k]} in
+                    sum) ;;
+                    wmean) WMEAN+="${WMEAN:+,}${k#agg.}" ;;
+                    *) add_error "counters: $COUNTERS_FILE: $k must be sum or wmean" ;;
+                esac ;;
+            *) add_error "counters: $COUNTERS_FILE: unknown key '$k' (pass.<k> or agg.<counter>)" ;;
+        esac
+    done
+    if ((${#PASS_SETS[@]} == 0)); then
+        add_error "counters: $COUNTERS_FILE defines no passes ($hint)"
+        return
+    fi
+    for ((n = 1; n <= ${#PASS_SETS[@]}; n++)); do
+        [[ -v "PASS_SETS[$((n - 1))]" ]] || add_error "counters: $COUNTERS_FILE: pass.$n is missing (passes must be numbered 1..K)"
+    done
+    command -v "$ROCPROF" >/dev/null 2>&1 ||
+        add_error "counters: profiler '$ROCPROF' not found (load the ROCm module or pass --rocprof)"
+}
+
 # ---------------------------------------------------------------------------
 # Phase 4: plan
 # ---------------------------------------------------------------------------
@@ -515,6 +591,10 @@ print_plan() {
         pinfo "Telemetry: sampler every $SAMPLE_INTERVAL ms, idle baseline $IDLE_SECONDS s"
         total=$(awk -v t="$total" -v i="$IDLE_SECONDS" 'BEGIN { print t + i }')
     fi
+    if profiling; then
+        pinfo "Counters: ${#PASS_SETS[@]} pass(es) per run with $NCOUNTERS counters, $PROFILE_DURATION s each ($ROCPROF, $COUNTERS_FILE)"
+        total=$(awk -v t="$total" -v n="$execs" -v k="${#PASS_SETS[@]}" -v d="$PROFILE_DURATION" 'BEGIN { print t + n * k * d }')
+    fi
     pinfo "Estimated time: at least $(fmt_secs "$total") for $execs execution(s) (runs + pauses, without start-up and verification)"
 }
 
@@ -537,6 +617,11 @@ prepare() {
     for l in "${PLAN_TEXT[@]}"; do log "PLAN   $l"; done
     cp -- "$CONFIG" "$RESDIR/config/runs.cfg"
     cp -- "$COMPONENT" "$RESDIR/config/component.cfg"
+    if profiling; then
+        cp -- "$COUNTERS_FILE" "$RESDIR/config/counters.cfg"
+        echo "label,rep,benchmark,benchmark_version,device,pass,counter,value,agg,dispatches,iterations,kernel_time_s,roi_s" \
+            >"$RESDIR/counters.csv"
+    fi
     for i in "${SEL[@]}"; do
         b=${RUN_BENCH[i]}
         [[ -v copied[$b] ]] && continue
@@ -684,6 +769,88 @@ on_signal() {
 # timed_out <t0_ns> <t1_ns> <timeout_s>: did the run last (almost) as long as the timeout?
 timed_out() { awk -v a="$1" -v b="$2" -v t="$3" 'BEGIN { exit !((b - a) / 1e9 >= t * 0.99) }'; }
 
+# run_passes <round> <index> <pass0 "runtime iterations">: counter passes 1..K of a run
+# under rocprofv3 (contract section 13). Appends to counters.csv and sets PFRAG
+# (m_prof_slowdown_p<k> members); on failure PASS_REASON is set and nothing is appended.
+run_passes() {
+    local r=$1 i=$2 perf0=$3
+    local label=${RUN_LABEL[i]} bench=${RUN_BENCH[i]} bin="$BIN_DIR/$bench"
+    local k n dir code tmo t0 t1 tag rest jstatus jreason roi perf cmd csv meta prefix sd
+    local rows="" nd it
+    local -a args pmc
+    PFRAG="" PASS_REASON=""
+    read -r -a args <<<"${RUN_EFF[i]}"
+    for ((n = 0; n < ${#args[@]}; n += 2)); do
+        [[ ${args[n]} == --duration ]] && args[n + 1]=$PROFILE_DURATION
+    done
+    tmo=${OPT_TIMEOUT:-$(awk -v d="$PROFILE_DURATION" -v f=$TIMEOUT_FACTOR -v o=$TIMEOUT_OFFSET \
+        'BEGIN { printf "%.3f", d * f + o }')}
+    prefix="$(csv_str "$label"),$r,$(csv_str "$bench"),$(csv_str "$(meta_get "$bench" version)"),$DEVICE"
+
+    for ((k = 1; k <= ${#PASS_SETS[@]}; k++)); do
+        dir="$RESDIR/runs/$label/rep$r/pass$k"
+        mkdir -p "$dir"
+        IFS=, read -r -a pmc <<<"${PASS_SETS[k - 1]}"
+        printf -v cmd '%q ' "HIP_VISIBLE_DEVICES=$DEVICE" timeout "$tmo" "$ROCPROF" --pmc "${pmc[@]}" \
+            --output-format csv -d "$dir/rocprof" -- "$bin" "${args[@]}"
+        printf '%s\n' "${cmd% }" >"$dir/command.txt"
+        t0=$(date +%s%N)
+        HIP_VISIBLE_DEVICES=$DEVICE timeout --kill-after=$KILL_AFTER "$tmo" \
+            "$ROCPROF" --pmc "${pmc[@]}" --output-format csv -d "$dir/rocprof" -- "$bin" "${args[@]}" \
+            >"$dir/stdout_raw.log" 2>"$dir/stderr.log" &
+        CHILD_PID=$!
+        wait "$CHILD_PID"
+        code=$?
+        CHILD_PID=""
+        t1=$(date +%s%N)
+        if { ((code == 124)) || ((code == 137)); } && timed_out "$t0" "$t1" "$tmo"; then
+            PASS_REASON="pass $k: killed after $tmo s"; return
+        fi
+        # the profiler may print log lines on stdout: the JSON line is the last line starting with {
+        grep '^{' "$dir/stdout_raw.log" | tail -n 1 >"$dir/stdout.json"
+        if ((code != 0 && code != 3)); then
+            PASS_REASON="pass $k: exit code $code: $(last_line "$dir/stderr.log")"; return
+        fi
+        jstatus="" jreason="" roi="" perf=""
+        while read -r tag rest; do
+            case $tag in
+                STATUS) jstatus=$rest ;;
+                REASON) jreason=$rest ;;
+                ROI)    roi=$rest ;;
+                PERF)   perf=$rest ;;
+            esac
+        done < <(awk -v duration="$PROFILE_DURATION" -f "$LIB/json.awk" -f "$LIB/bench_json.awk" "$dir/stdout.json")
+        if [[ $jstatus != ok || -z $roi ]]; then
+            PASS_REASON="pass $k: contract: ${jreason:-no ROI}"; return
+        fi
+        csv=$(find "$dir/rocprof" -name '*counter_collection.csv' 2>/dev/null | head -n 1)
+        if [[ -z $csv ]]; then
+            PASS_REASON="pass $k: no counter_collection.csv from $ROCPROF"; return
+        fi
+        read -r t0 t1 <<<"$roi"
+        read -r _ it <<<"$perf"
+        meta=$(awk -v t0="$t0" -v t1="$t1" -v wmean="$WMEAN" -v prefix="$prefix,$k" -v iterations="$it" \
+            -f "$LIB/counters.awk" "$csv")
+        if grep -q '^ERR ' <<<"$meta"; then
+            PASS_REASON="pass $k: $(grep -m1 '^ERR ' <<<"$meta" | cut -c5-)"; return
+        fi
+        read -r _ nd _ <<<"$(grep -m1 '^META ' <<<"$meta")"
+        if [[ -z $nd ]] || ((nd == 0)); then
+            PASS_REASON="pass $k: no kernel dispatch inside the ROI (profiler timestamps not on the monotonic clock?)"; return
+        fi
+        ((nd == it)) || log "       pass $k: $nd dispatches in the ROI, $it iterations"
+        for n in "${pmc[@]}"; do
+            grep -q "^ROW .*,\"$n\"," <<<"$meta" ||
+                { PASS_REASON="pass $k: counter $n missing in the output of $ROCPROF"; return; }
+        done
+        rows+=$(grep '^ROW ' <<<"$meta" | cut -c5-)$'\n'
+        sd=$(awk -v p="$perf" -v q="$perf0" 'BEGIN { split(p, a, " "); split(q, b, " ")
+            if (a[2] > 0 && b[1] > 0 && b[2] > 0) printf "%.4f", (a[1] / a[2]) / (b[1] / b[2]) }')
+        [[ -n $sd ]] && PFRAG+="${PFRAG:+,}\"m_prof_slowdown_p$k\":$sd"
+    done
+    printf '%s' "$rows" >>"$RESDIR/counters.csv"
+}
+
 # run_one <round> <index>: execute one run, write its record; sets RAN=1 if executed
 run_one() {
     local r=$1 i=$2
@@ -691,13 +858,13 @@ run_one() {
     local dir="$RESDIR/runs/$label/rep$r/pass0"
     local bin="$BIN_DIR/$bench"
     local status="" reason="" rc="null" fragment="" cmd tmo t0 t1 code
-    local jstatus="" jreason="" jverify="null" tag rest roi="" bdf=""
+    local jstatus="" jreason="" jverify="null" tag rest roi="" bdf="" perf=""
     local -a args
     read -r -a args <<<"${RUN_EFF[i]}"
     printf -v cmd '%q ' "HIP_VISIBLE_DEVICES=$DEVICE" "$bin" "${args[@]}"
     cmd=${cmd% }
     RAN=0
-    MFRAG=""
+    MFRAG="" PFRAG=""
 
     if [[ -n ${RUN_SKIP_PREC[i]} ]]; then
         status=skipped
@@ -732,6 +899,7 @@ run_one() {
                             VERIFY)   jverify=$rest ;;
                             ROI)      roi=$rest ;;
                             BDF)      bdf=$rest ;;
+                            PERF)     perf=$rest ;;
                             FRAGMENT) fragment=$rest ;;
                         esac
                     done < <(awk -v duration="${RUN_DUR[i]}" -f "$LIB/json.awk" -f "$LIB/bench_json.awk" \
@@ -757,6 +925,15 @@ run_one() {
                             reason="telemetry: $TEL_REASON"
                         fi
                     fi
+                    # hardware counters: passes 1..K (only after a usable pass 0)
+                    if profiling && [[ $status == ok || $status == invalid ]]; then
+                        run_passes "$r" "$i" "$perf"
+                        if [[ -n $PASS_REASON ]]; then
+                            status=error
+                            reason="counters: $PASS_REASON"
+                            PFRAG=""
+                        fi
+                    fi
                     ;;
                 1) status=error;   reason="exit code 1: $(last_line "$dir/stderr.log")" ;;
                 2) status=skipped; reason="not supported on this hardware: $(last_line "$dir/stderr.log")" ;;
@@ -776,6 +953,7 @@ run_one() {
     rec+=",\"exit_code\":$rc,\"cmd\":$(json_str "$cmd")"
     [[ -n $fragment ]] && rec+=",$fragment"
     [[ -n $MFRAG ]] && rec+=",$MFRAG"
+    [[ -n $PFRAG ]] && rec+=",$PFRAG"
     rec+="}"
 
     printf '%s\n' "$rec" >>"$RESDIR/results.jsonl"
@@ -849,7 +1027,7 @@ finish() {
     info "Results: $RESDIR"
     log "END    $summary"
     if ((SAMPLER_DIED || COUNT[error] + COUNT[invalid] + COUNT[timeout] > 0)); then
-        info "Details of failed runs: $RESDIR/wrapper.log and runs/<label>/rep<i>/pass0/stderr.log"
+        info "Details of failed runs: $RESDIR/wrapper.log and runs/<label>/rep<i>/pass<k>/stderr.log"
         exit 4
     fi
     exit 0
@@ -876,6 +1054,7 @@ fi
 validate_runs
 check_args
 [[ $MODE == check ]] && check_param_defaults
+profiling && load_counters
 if monitoring && [[ ! -x $BIN_DIR/sampler ]]; then
     add_error "telemetry: sampler '$BIN_DIR/sampler' not found or not executable (build it with: build.sh sampler)"
 fi
@@ -889,7 +1068,6 @@ for i in "${SEL[@]}"; do
     ((${#RUN_BENCH[i]} > BW)) && BW=${#RUN_BENCH[i]}
 done
 print_plan
-[[ $MODE == validation ]] && notice "hardware counters are not implemented yet: validation runs only pass 0 (telemetry)"
 if ((DRY_RUN)); then info "Dry run: nothing was executed."; exit 0; fi
 
 # phase 5-8

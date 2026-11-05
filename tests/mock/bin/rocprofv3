@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# rocprofv3 (mock) - imitates rocprofv3 in counter collection mode for the tests, without a GPU
+#
+#   rocprofv3 --pmc <counter> [<counter> ...] --output-format csv -d <dir> -- <command ...>
+#
+# Runs the command, passes its stdout and exit code through, and writes
+# <dir>/<host>/<pid>_counter_collection.csv in the format of the real rocprofv3
+# (one row per dispatch and counter). The dispatches are derived from the
+# benchmark's JSON line: one warmup dispatch before the ROI and `iterations`
+# dispatches evenly inside the ROI, on the same clock as the benchmark.
+#
+# Counter values per dispatch: SQ_WAVES = 7296, MeanOccupancyPerCU = 12.5,
+# every other counter = 1000 x (its position in --pmc).
+#
+# Environment (for failure tests):
+#   MOCK_ROCPROF_MAX=<n>        reject requests with more than n counters (default 8)
+#   MOCK_ROCPROF_REJECT=<a,b>   counters that cannot be collected at all
+#   MOCK_ROCPROF=noisy          also print log lines on stdout
+#   MOCK_ROCPROF=fail           exit 1 after the command, without output file
+#   MOCK_ROCPROF=clockshift     timestamps on another clock (no dispatch inside the ROI)
+
+pmc=() dir="" fmt=""
+while (($#)); do
+    case $1 in
+        --pmc)
+            shift
+            while (($#)) && [[ $1 != --* ]]; do pmc+=("$1"); shift; done ;;
+        --output-format) fmt=$2; shift 2 ;;
+        -d) dir=$2; shift 2 ;;
+        --) shift; break ;;
+        *) echo "rocprofv3 (mock): unknown option $1" >&2; exit 1 ;;
+    esac
+done
+(($#)) || { echo "rocprofv3 (mock): no command given" >&2; exit 1; }
+[[ $fmt == csv && -n $dir ]] || { echo "rocprofv3 (mock): need --output-format csv and -d" >&2; exit 1; }
+((${#pmc[@]})) || { echo "rocprofv3 (mock): no counters given" >&2; exit 1; }
+
+max=${MOCK_ROCPROF_MAX:-8}
+if ((${#pmc[@]} > max)); then
+    echo "rocprofv3 (mock): Request exceeded the capacity of the hardware counters (${#pmc[@]} > $max)" >&2
+    exit 1
+fi
+for c in "${pmc[@]}"; do
+    if [[ ,${MOCK_ROCPROF_REJECT:-}, == *,$c,* ]]; then
+        echo "rocprofv3 (mock): counter $c cannot be collected on this agent" >&2
+        exit 1
+    fi
+done
+
+mode=${MOCK_ROCPROF:-}
+[[ $mode == noisy ]] && echo "W20251105 rocprofv3 (mock) log line on stdout"
+out=$("$@")
+rc=$?
+[[ -n $out ]] && printf '%s\n' "$out"
+[[ $mode == noisy ]] && echo "rocprofv3 (mock): done"
+if [[ $mode == fail ]]; then
+    echo "rocprofv3 (mock): fatal error while writing the results" >&2
+    exit 1
+fi
+
+json=$(grep '^{' <<<"$out" | tail -1)
+r0=$(sed -n 's/.*"roi_start_mono_ns": *\([0-9]*\).*/\1/p' <<<"$json")
+r1=$(sed -n 's/.*"roi_end_mono_ns": *\([0-9]*\).*/\1/p' <<<"$json")
+it=$(sed -n 's/.*"iterations": *\([0-9]*\).*/\1/p' <<<"$json")
+mkdir -p "$dir/mockhost"
+f="$dir/mockhost/$$_counter_collection.csv"
+echo '"Correlation_Id","Dispatch_Id","Agent_Id","Queue_Id","Process_Id","Thread_Id","Grid_Size","Kernel_Id","Kernel_Name","Workgroup_Size","LDS_Block_Size","Scratch_Size","VGPR_Count","Accum_VGPR_Count","SGPR_Count","Counter_Name","Counter_Value","Start_Timestamp","End_Timestamp"' >"$f"
+if [[ -n $r0 && -n $r1 && -n $it ]]; then
+    shift_ns=0
+    [[ $mode == clockshift ]] && shift_ns=1000000000000
+    awk -v r0="$r0" -v r1="$r1" -v it="$it" -v pid=$$ -v sh="$shift_ns" -v list="${pmc[*]}" 'BEGIN {
+        nc = split(list, c, " ")
+        step = (r1 - r0) / it
+        for (d = 0; d <= it; d++) {
+            if (d == 0) { s = r0 - 2000000; e = r0 - 1000000 }        # warmup, before the ROI
+            else        { s = r0 + (d - 1) * step + step * 0.05; e = s + step * 0.8 }
+            for (k = 1; k <= nc; k++) {
+                v = (c[k] == "SQ_WAVES") ? 7296 : (c[k] == "MeanOccupancyPerCU") ? 12.5 : 1000 * k
+                printf "%d,%d,\"Agent 4\",1,%d,%d,466944,17,\"void arith<double>(double const*, double*, long)\",256,0,0,12,4,16,\"%s\",%.6f,%.0f,%.0f\n",
+                       d * nc + k, d + 1, pid, pid, c[k], v, s + sh, e + sh
+            }
+        }
+    }' >>"$f"
+fi
+exit $rc

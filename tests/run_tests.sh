@@ -49,10 +49,12 @@ cfg() { printf '%s\n' "$1" >"$CDIR/runs.cfg"; }
 # wrapper command with the mocks. Later options override earlier ones,
 # so a test can pass its own --config, --component etc.
 # Telemetry defaults keep the tests fast: no idle baseline, sampler every 20 ms.
+# Counter defaults: mock rocprofv3, tests/mock/counters.cfg (2 passes), 0.05 s per pass.
 wrap_cmd() {
     WRAP_CMD=("$SUITE/run_suite.sh" --src-dir "$MOCK/src" --bin-dir "$MOCK/bin"
               --component "$MOCK/component.cfg" --config "$CDIR/runs.cfg"
-              --results "$CDIR/results" --idle 0 --sample-interval 20 "$@")
+              --results "$CDIR/results" --idle 0 --sample-interval 20
+              --rocprof "$MOCK/bin/rocprofv3" --counters "$MOCK/counters.cfg" --profile-duration 0.05 "$@")
 }
 
 # wrap <args...>: run the wrapper; sets RC and DIR
@@ -948,6 +950,214 @@ test_sampler_stopped_on_sigterm() {
     sleep 0.3
     sampler_running && { fail_check "sampler still running"; pkill -f "[s]ampler --interval-ms [0-9]+ --out $TMP/"; }
     pkill -fx "sleep 100000"
+}
+
+# ===========================================================================
+# Hardware counters (validation mode, rocprofv3 mock)
+# ===========================================================================
+
+# counter_value <label> <pass> <counter> <column>: one cell of counters.csv
+counter_value() {
+    awk -F, -v l="\"$1\"" -v p="$2" -v c="\"$3\"" -v col="$4" '
+        NR == 1 { for (i = 1; i <= NF; i++) if ($i == col) k = i; next }
+        $1 == l && $6 == p && $7 == c && k { print $k; exit }' "$DIR/counters.csv" 2>/dev/null
+}
+
+# check_counter <label> <pass> <counter> <column> <expected>
+check_counter() {
+    need_dir || return
+    local v
+    v=$(counter_value "$1" "$2" "$3" "$4")
+    [[ $v == "$5" ]] || fail_check "counters.csv: $4 of $3 ($1, pass $2) is '$v', expected '$5'"
+}
+
+register counters_written_in_long_format
+test_counters_written_in_long_format() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --duration 0.2
+    check_rc 0
+    check_status a 1 ok
+    need_dir || return
+    check_csv "$DIR/counters.csv" 4            # 2 passes x 2 counters
+    check_contains "$DIR/counters.csv" "label,rep,benchmark,benchmark_version,device,pass,counter,value,agg,dispatches,iterations,kernel_time_s,roi_s"
+    check_counter a 1 SQ_INSTS_VALU pass 1
+    check_counter a 2 TCC_HIT_sum pass 2
+    check_exists "$DIR/runs/a/rep1/pass2/stdout.json"
+}
+
+register counters_exclude_dispatches_outside_roi
+test_counters_exclude_dispatches_outside_roi() {
+    # the mock writes one warmup dispatch before the ROI and one per iteration inside it
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --duration 0.2
+    need_dir || return
+    local it
+    it=$(counter_value a 1 SQ_WAVES iterations)
+    [[ $it =~ ^[1-9][0-9]*$ ]] || { fail_check "iterations of pass 1 missing ('$it')"; return; }
+    check_counter a 1 SQ_WAVES dispatches "$it"
+    check_counter a 1 SQ_WAVES value "$((7296 * it))"
+}
+
+register counters_wmean_aggregation
+test_counters_wmean_aggregation() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --duration 0.2
+    check_counter a 2 MeanOccupancyPerCU value 12.5
+    check_counter a 2 MeanOccupancyPerCU agg '"wmean"'
+    check_counter a 1 SQ_WAVES agg '"sum"'
+}
+
+register counters_use_profile_duration
+test_counters_use_profile_duration() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --duration 0.2 --profile-duration 0.07
+    need_dir || return
+    check_contains "$DIR/runs/a/rep1/pass1/command.txt" "--duration 0.07"
+    check_contains "$DIR/runs/a/rep1/pass0/command.txt" "--duration 0.2"
+}
+
+register counters_prof_slowdown_fields
+test_counters_prof_slowdown_fields() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --duration 0.2
+    check_num a 1 m_prof_slowdown_p1 1 0.2
+    check_num a 1 m_prof_slowdown_p2 1 0.2
+}
+
+register counters_tolerate_profiler_stdout
+test_counters_tolerate_profiler_stdout() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    MOCK_ROCPROF=noisy wrap --mode validation --duration 0.2
+    check_status a 1 ok
+    need_dir && check_csv "$DIR/counters.csv" 4
+}
+
+register counters_profiler_failure_is_error
+test_counters_profiler_failure_is_error() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    MOCK_ROCPROF=fail wrap --mode validation --duration 0.2
+    check_rc 4
+    check_status a 1 error
+    check_record a 1 '"reason":"counters: pass 1: exit code 1'
+    need_dir && check_csv "$DIR/counters.csv" 0
+}
+
+register counters_other_clock_is_error
+test_counters_other_clock_is_error() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    MOCK_ROCPROF=clockshift wrap --mode validation --duration 0.2
+    check_status a 1 error
+    check_record a 1 "no kernel dispatch inside the ROI"
+}
+
+register counters_rejected_counter_is_error
+test_counters_rejected_counter_is_error() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    MOCK_ROCPROF_REJECT=TCC_HIT_sum wrap --mode validation --duration 0.2
+    check_status a 1 error
+    check_record a 1 "counters: pass 2:"
+    need_dir && check_csv "$DIR/counters.csv" 0     # nothing of a half-profiled run
+}
+
+register counters_missing_config_rejected
+test_counters_missing_config_rejected() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --counters "$CDIR/none.cfg"
+    check_rejected "plan_counter_passes.sh"
+}
+
+register counters_invalid_config_rejected
+test_counters_invalid_config_rejected() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    printf 'pass.1=SQ_WAVES\npass.3=SQ_BUSY_CYCLES\nagg.SQ_WAVES=max\n' >"$CDIR/c.cfg"
+    wrap --mode validation --counters "$CDIR/c.cfg"
+    check_rejected "pass.2 is missing"
+    check_contains "$CDIR/err" "agg.SQ_WAVES must be sum or wmean"
+}
+
+register counters_missing_profiler_rejected
+test_counters_missing_profiler_rejected() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --rocprof "$CDIR/no_rocprofv3"
+    check_rejected "profiler '$CDIR/no_rocprofv3' not found"
+}
+
+register counters_not_in_production
+test_counters_not_in_production() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode production --duration 0.2 --pause 0 --counters "$CDIR/none.cfg"
+    check_rc 0
+    need_dir || return
+    check_absent "$DIR/counters.csv"
+    check_absent "$DIR/runs/a/rep1/pass1"
+}
+
+register counters_no_passes_after_failed_pass0
+test_counters_no_passes_after_failed_pass0() {
+    cfg "a  mock_contract  --duration {DURATION}"      # exit 0, but output violates the contract
+    wrap --mode validation --duration 0.2
+    check_status a 1 error
+    check_record a 1 '"reason":"contract:'
+    need_dir || return
+    check_absent "$DIR/runs/a/rep1/pass1"
+}
+
+register counters_shown_in_plan
+test_counters_shown_in_plan() {
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --dry-run
+    check_contains "$CDIR/err" "Counters: 2 pass(es) per run with 4 counters"
+}
+
+# ---- tools/plan_counter_passes.sh ----
+
+# plan <args...>: run the pass planner with the mock profiler and a mock test command; sets RC
+plan() {
+    "$SUITE/tools/plan_counter_passes.sh" --component "$MOCK/component.cfg" --rocprof "$MOCK/bin/rocprofv3" \
+        --test-command "$MOCK/bin/mock_ok --duration 0.01" --wishlist "$CDIR/wish.cfg" --out "$CDIR/counters.cfg" \
+        "$@" >"$CDIR/out" 2>"$CDIR/err"
+    RC=$?
+}
+
+register planner_packs_counters_into_passes
+test_planner_packs_counters_into_passes() {
+    printf 'want.a=C1,C2,C3\nwant.b=C4,C5\nagg.C5=wmean\n' >"$CDIR/wish.cfg"
+    MOCK_ROCPROF_MAX=2 plan
+    check_rc 0
+    check_contains "$CDIR/counters.cfg" "pass.1=C1,C2"
+    check_contains "$CDIR/counters.cfg" "pass.2=C3,C4"
+    check_contains "$CDIR/counters.cfg" "pass.3=C5"
+    check_contains "$CDIR/counters.cfg" "agg.C5=wmean"
+}
+
+register planner_skips_rejected_counter
+test_planner_skips_rejected_counter() {
+    printf 'want.a=C1,BAD,C2\n' >"$CDIR/wish.cfg"
+    MOCK_ROCPROF_REJECT=BAD plan
+    check_rc 0
+    check_contains "$CDIR/counters.cfg" "pass.1=C1,C2"
+    check_contains "$CDIR/counters.cfg" "skipped (rejected even alone): BAD"
+    check_contains "$CDIR/err" "counter BAD is rejected even alone"
+}
+
+register planner_output_accepted_by_wrapper
+test_planner_output_accepted_by_wrapper() {
+    printf 'want.a=SQ_WAVES,SQ_INSTS_VALU,TCC_HIT_sum\nagg.SQ_WAVES=sum\n' >"$CDIR/wish.cfg"
+    MOCK_ROCPROF_MAX=2 plan
+    check_rc 0
+    cfg "a  mock_ok  --duration {DURATION}"
+    wrap --mode validation --duration 0.2 --counters "$CDIR/counters.cfg"
+    check_rc 0
+    need_dir && check_csv "$DIR/counters.csv" 3
+}
+
+register planner_missing_test_binary
+test_planner_missing_test_binary() {
+    printf 'want.a=C1\n' >"$CDIR/wish.cfg"
+    plan --test-command "$CDIR/nope --duration 1"
+    check_rc 1
+    check_contains "$CDIR/err" "not found or not executable"
+    check_absent "$CDIR/counters.cfg"
 }
 
 # ===========================================================================

@@ -8,6 +8,7 @@
 #   VERIFY true|false|null
 #   ROI <start_mono_ns> <end_mono_ns>   (only if both are valid; raw text, no rounding)
 #   BDF <pci address>                   (only if e_pci_bus_id is valid)
+#   PERF <runtime_s> <iterations>       (only if both are valid; for m_prof_slowdown_p<k>)
 #   FRAGMENT <json members>        benchmark fields as  "k":v,"k":v  (no braces);
 #                                  fields with reserved or invalid names are left out
 
@@ -41,6 +42,7 @@ END {
     print "VERIFY " verify
     if (roi != "") print "ROI " roi
     if (bdf != "") print "BDF " bdf
+    if (perf != "") print "PERF " perf
     print "FRAGMENT " fragment
 }
 
@@ -77,6 +79,7 @@ function check(    i, k, n, req, rt, ws) {
         rt = num("runtime_s")
         if (num("iterations") < 1 || num("iterations") != int(num("iterations")))
             violation("iterations must be an integer >= 1")
+        else if (rt > 0) perf = J_val[J_idx["runtime_s"]] " " J_val[J_idx["iterations"]]
         if (rt <= 0) violation("runtime_s must be > 0")
         else if (rt < duration * 0.999)
             violation("runtime_s (" rt ") is shorter than the requested duration (" duration ")")
