@@ -2,15 +2,15 @@
 // benchmark=cache
 // level=1
 // component=GPU/Memory/Cache
-// description=Cache bandwidth kernel of the rocprof-compute roofline (all blocks re-read one buffer of cache size); L1, L2 or Infinity Cache
+// description=Cache bandwidth kernel of the rocprof-compute roofline (all blocks re-read one buffer of cache size); L1, L2 or LLC (Infinity Cache)
 // tags=memory-bound;bandwidth;cache
 // version=0.2.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
-// param.level=l1|l1, l2, mall|Cache level: buffer of 32 KiB (L1), 4 MiB (L2) or 64 MiB (Infinity Cache), sizes for gfx942
-// param.passes=auto|auto or >= 1|How often every block reads the whole buffer per launch; auto = 100 (l1), 10 (l2), 1 (mall) as in rocprof-compute
+// param.level=l1|l1, l2, llc|Cache level: buffer of 32 KiB (L1), 4 MiB (L2) or 64 MiB (LLC = Infinity Cache), sizes for gfx942
+// param.passes=auto|auto or >= 1|How often every block reads the whole buffer per launch; auto = 100 (l1), 10 (l2), 1 (llc) as in rocprof-compute
 //
 // # Expectations (validation mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=global_load_dword
@@ -29,7 +29,9 @@
 // ahead of time instead of hiprtc; time loop over --duration with ROI time
 // stamps and JSON output; argument check; the buffer is initialized (in
 // rocprof-compute it is summed uninitialized); no verification (all blocks
-// write the same result array, verify_ok = null).
+// write the same result array, verify_ok = null). The last level cache is
+// called llc here, as in the rest of the suite (component config llc_bytes);
+// AMD calls it MALL (Memory Attached Last Level cache).
 //
 // Replaces cache 0.1.0 (own kernel: every block read its own chunk, 4 blocks
 // per CU, double): it reached only ~14 TB/s for both L1 and L2, probably too
@@ -83,10 +85,10 @@
 static const int WORKGROUP_SIZE = 256;   // as in rocprof-compute
 static const int BLOCKS_PER_CU = 128;    // as in rocprof-compute
 
-// Buffer sizes for gfx942 (rocprof-compute: L1 32 KiB, L2 4 MiB, MALL 64 MiB)
+// Buffer sizes for gfx942 (rocprof-compute: L1 32 KiB, L2 4 MiB, MALL = LLC 64 MiB)
 static const int L1_SIZE   = 32 * 1024;
 static const int L2_SIZE   = 4 * 1024 * 1024;
-static const int MALL_SIZE = 64 * 1024 * 1024;
+static const int LLC_SIZE  = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Kernel (rocprofiler-compute, MIT license, see header) -- unchanged
@@ -189,8 +191,8 @@ int main(int argc, char** argv) {
         } else if (!strcmp(key, "--level")) {
             if (have_level) { fprintf(stderr, "cache: --level given twice\n"); return 1; }
             have_level = true;
-            if (strcmp(val, "l1") && strcmp(val, "l2") && strcmp(val, "mall")) {
-                fprintf(stderr, "cache: --level must be l1, l2 or mall (got '%s')\n", val);
+            if (strcmp(val, "l1") && strcmp(val, "l2") && strcmp(val, "llc")) {
+                fprintf(stderr, "cache: --level must be l1, l2 or llc (got '%s')\n", val);
                 return 1;
             }
             level = val;
@@ -220,7 +222,7 @@ int main(int argc, char** argv) {
     } else if (!strcmp(level, "l2")) {
         kernel = Cache_bw<float, L2_SIZE, WORKGROUP_SIZE>;   cache_size = L2_SIZE;   auto_passes = 10;
     } else {
-        kernel = Cache_bw<float, MALL_SIZE, WORKGROUP_SIZE>; cache_size = MALL_SIZE; auto_passes = 1;
+        kernel = Cache_bw<float, LLC_SIZE, WORKGROUP_SIZE>;  cache_size = LLC_SIZE;  auto_passes = 1;
     }
     if (passes == 0) passes = auto_passes;
 
