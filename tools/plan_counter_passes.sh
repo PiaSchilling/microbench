@@ -3,6 +3,7 @@
 #
 # Usage: tools/plan_counter_passes.sh [--component <file>] [--wishlist <file>] [--out <file>]
 #                                     [--rocprof <cmd>] [--device <n>] [--test-command "<cmd>"]
+#                                     [--test-timeout <s>]
 #
 # Reads the wish list (config/counters_wishlist_<arch>.cfg), packs the counters greedily
 # into passes and tests every candidate pass with rocprofv3 on a short test run: a
@@ -10,7 +11,8 @@
 # reports every counter; otherwise a new pass is started. A counter that is
 # rejected even alone is skipped with a warning.
 # Writes config/counters_<arch>.cfg (pass.<k>=... and the agg.* lines of the wish list).
-# Run once per system, on a GPU node. Takes about one test run per counter.
+# Run once per system, on a GPU node. Takes about one test run per counter; every test
+# run is printed (on stderr) with its result and duration.
 
 set -uo pipefail
 
@@ -24,6 +26,7 @@ OUT=""
 ROCPROF=${ROCPROF:-rocprofv3}
 DEVICE=0
 TEST_CMD=""
+TEST_TIMEOUT=60
 
 while (($#)); do
     case $1 in
@@ -33,7 +36,8 @@ while (($#)); do
         --rocprof)      ROCPROF=${2:?--rocprof requires a value}; shift 2 ;;
         --device)       DEVICE=${2:?--device requires a value}; shift 2 ;;
         --test-command) TEST_CMD=${2:?--test-command requires a value}; shift 2 ;;
-        --help | -h)    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --test-timeout) TEST_TIMEOUT=${2:?--test-timeout requires a value}; shift 2 ;;
+        --help | -h)    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "unknown option '$1' (see --help)" ;;
     esac
 done
@@ -47,6 +51,7 @@ TEST_CMD=${TEST_CMD:-$SUITE_DIR/build/fma --duration 0.001 --ops_per_element 100
 
 command -v "$ROCPROF" >/dev/null 2>&1 || die "rocprofv3 not found ('$ROCPROF'; set --rocprof or load the ROCm module)"
 read -r -a TEST <<<"$TEST_CMD"
+[[ $TEST_TIMEOUT =~ ^[1-9][0-9]*$ ]] || die "--test-timeout must be an integer >= 1 (s)"
 [[ -x ${TEST[0]} ]] || die "test command '${TEST[0]}' not found or not executable (run build.sh first)"
 
 # ---- wish list ----
@@ -81,22 +86,49 @@ done
 
 # ---- test one combination ----
 TMP=$(mktemp -d)
+CHILD_PID=""
 trap 'rm -rf "$TMP"' EXIT
+# timeout puts the profiler into its own process group, so Ctrl-C from the terminal
+# does not reach it. The test runs in the background; on INT/TERM it is stopped here.
+on_signal() {
+    trap '' INT TERM
+    printf '\n' >&2
+    [[ -n $CHILD_PID ]] && { kill -TERM "$CHILD_PID" 2>/dev/null; wait "$CHILD_PID" 2>/dev/null; }
+    warn "aborted by SIG$1; nothing was written"
+    exit 130
+}
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
 NTEST=0
 
-# accepts <counter...>: 0 if rocprofv3 collects all of them in one pass
+# accepts <counter...>: 0 if rocprofv3 collects all of them in one pass.
+# Prints one progress line per test run: number, pass size, new counter, result, duration.
 accepts() {
-    local d="$TMP/t$NTEST" csv c
+    local d="$TMP/t$NTEST" csv c rc t0 t1 res=ok
     NTEST=$((NTEST + 1))
-    HIP_VISIBLE_DEVICES=$DEVICE timeout 120 "$ROCPROF" --pmc "$@" --output-format csv -d "$d" -- "${TEST[@]}" \
-        >"$TMP/out" 2>"$TMP/err" || return 1
-    csv=$(find "$d" -name '*counter_collection.csv' 2>/dev/null | head -1)
-    [[ -n $csv ]] || return 1
-    for c in "$@"; do
-        grep -qF "\"$c\"" "$csv" || return 1
-    done
+    printf '  test %3d: %2d counter(s), last %-34s ' "$NTEST" "$#" "${!#}" >&2
+    t0=$(date +%s%N)
+    HIP_VISIBLE_DEVICES=$DEVICE timeout --kill-after=10 "$TEST_TIMEOUT" "$ROCPROF" --pmc "$@" \
+        --output-format csv -d "$d" -- "${TEST[@]}" >"$TMP/out" 2>"$TMP/err" &
+    CHILD_PID=$!
+    wait "$CHILD_PID"
+    rc=$?
+    CHILD_PID=""
+    t1=$(date +%s%N)
+    if ((rc == 124 || rc == 137)); then res="timeout after $TEST_TIMEOUT s"
+    elif ((rc != 0)); then res="rejected (exit $rc)"
+    else
+        csv=$(find "$d" -name '*counter_collection.csv' 2>/dev/null | head -1)
+        if [[ -z $csv ]]; then res="rejected (no counter_collection.csv)"
+        else
+            for c in "$@"; do
+                grep -qF "\"$c\"" "$csv" || { res="rejected ($c missing in output)"; break; }
+            done
+        fi
+    fi
+    awk -v r="$res" -v a="$t0" -v b="$t1" 'BEGIN { printf "%s  %.1f s\n", r, (b - a) / 1e9 }' >&2
     rm -rf "$d"
-    return 0
+    [[ $res == ok ]]
 }
 
 # ---- greedy packing ----
