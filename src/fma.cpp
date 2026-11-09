@@ -2,9 +2,9 @@
 // benchmark=fma
 // level=1
 // component=GPU/Compute/VALU
-// description=Four independent multiply-add chains per thread (Guerreiro); compute pole of the design space
+// description=Four independent FMA chains per thread with bounded, changing values; compute pole of the design space
 // tags=compute-bound;valu
-// version=0.4.0
+// version=0.5.0
 // precisions=fp64,fp32,fp16,int64,int32,int16,int8
 // extra_build_flags=
 //
@@ -20,11 +20,23 @@
 // expect_counters=
 // ---- end metadata ----
 //
-// Kernel: 1:1 from Guerreiro et al., ported to HIP. Each thread loads one value,
-// runs four independent chains r = r*r + r for ops_per_element iterations and
-// stores the sum. Interface: docs/benchmark_contract.md.
+// Kernel: based on Guerreiro et al. (HPCA 2018, computeKernel.cu), ported to HIP.
+// Each thread loads one value, runs four independent chains of ops_per_element
+// multiply-adds and stores the sum. Interface: docs/benchmark_contract.md.
 //
-// Integer types are unsigned, so overflow is defined (wrap-around).
+// Floating point (since 0.5.0): the original chain r = r*r + r overflows to inf
+// after 7 (fp16), 10 (fp32) or 13 (fp64) iterations; afterwards the same value
+// repeats, hardly any bits toggle and the power draw is far too low although the
+// VALU is fully busy (docs: validation findings 6 and 12). Now each chain
+// alternates between two FMAs that undo each other:
+//     r = r * a  + b        (a = 1.3, b = 0.7)
+//     r = r * ai + bi       (ai = 1/a, bi = -b/a)
+// The values stay bounded and change in every step (they jump between two
+// values per chain). a, b, ai, bi are kernel arguments, so the compiler cannot
+// fold the two FMAs at compile time.
+//
+// Integer types: unchanged, r = r*r + r. They are unsigned, so overflow is
+// defined (wrap-around) and the values keep changing.
 // bf16 is not included (no native VALU arithmetic on gfx942).
 
 #include <hip/hip_runtime.h>
@@ -62,8 +74,10 @@ __device__ __forceinline__ uint16_t mad<uint16_t>(uint16_t a, uint16_t b, uint16
     return (uint16_t)((unsigned)a * (unsigned)b + (unsigned)c);
 }
 
+// N multiply-adds per chain in total, as before (accounting: 8 operations per
+// iteration and thread). a, b, ai, bi are only used for floating-point types.
 template <typename T>
-__global__ void arith(const T* A, T* B, long N) {
+__global__ void arith(const T* A, T* B, long N, T a, T b, T ai, T bi) {
     size_t threadId = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
 
     T r0, r1, r2, r3;
@@ -72,12 +86,24 @@ __global__ void arith(const T* A, T* B, long N) {
     r2 = r0 + (T)2;
     r3 = r0 + (T)3;
 
+    if constexpr (std::is_integral<T>::value) {
 #pragma unroll 4
-    for (long i = 0; i < N; i++) {
-        r0 = mad(r0, r0, r0);
-        r1 = mad(r1, r1, r1);
-        r2 = mad(r2, r2, r2);
-        r3 = mad(r3, r3, r3);
+        for (long i = 0; i < N; i++) {
+            r0 = mad(r0, r0, r0);
+            r1 = mad(r1, r1, r1);
+            r2 = mad(r2, r2, r2);
+            r3 = mad(r3, r3, r3);
+        }
+    } else {
+        // pairs of FMAs that undo each other: values stay bounded and change
+#pragma unroll 2
+        for (long i = 0; i + 1 < N; i += 2) {
+            r0 = mad(r0, a, b);   r1 = mad(r1, a, b);   r2 = mad(r2, a, b);   r3 = mad(r3, a, b);
+            r0 = mad(r0, ai, bi); r1 = mad(r1, ai, bi); r2 = mad(r2, ai, bi); r3 = mad(r3, ai, bi);
+        }
+        if (N & 1) {              // odd N: one more step, so the total stays N
+            r0 = mad(r0, a, b);   r1 = mad(r1, a, b);   r2 = mad(r2, a, b);   r3 = mad(r3, a, b);
+        }
     }
 
     B[threadId] = r0 + r1 + r2 + r3;
@@ -138,8 +164,13 @@ static int run(double duration, long N, const char* precision) {
     HIP_CHECK(hipMalloc(&d_B, total * sizeof(T)));
     HIP_CHECK(hipMemcpy(d_A, h_A, total * sizeof(T), hipMemcpyHostToDevice));
 
+    // Constants of the FMA pair (floating point only), computed in double and
+    // converted to T; passed as kernel arguments (see header).
+    const double a_d = 1.3, b_d = 0.7;
+    const T a = (T)a_d, b = (T)b_d, ai = (T)(1.0 / a_d), bi = (T)(-b_d / a_d);
+
     // Warmup (not part of the ROI)
-    hipLaunchKernelGGL(arith<T>, dim3(blocks), dim3(threads), 0, 0, d_A, d_B, N);
+    hipLaunchKernelGGL(arith<T>, dim3(blocks), dim3(threads), 0, 0, d_A, d_B, N, a, b, ai, bi);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -150,7 +181,7 @@ static int run(double duration, long N, const char* precision) {
     mono_clock::time_point t1;
     double elapsed;
     do {
-        hipLaunchKernelGGL(arith<T>, dim3(blocks), dim3(threads), 0, 0, d_A, d_B, N);
+        hipLaunchKernelGGL(arith<T>, dim3(blocks), dim3(threads), 0, 0, d_A, d_B, N, a, b, ai, bi);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
         ++launches;
@@ -158,6 +189,20 @@ static int run(double duration, long N, const char* precision) {
         elapsed = std::chrono::duration<double>(t1 - t0).count();
     } while (elapsed < duration);
     const unix_clock::time_point u1 = unix_clock::now();
+
+    // Verification (after the ROI): floating point results must be finite.
+    // Integers: no verification (wrap-around is intended).
+    const char* verify = "null";
+    if constexpr (!is_int) {
+        T* h_B = (T*)malloc(total * sizeof(T));
+        if (!h_B) { fprintf(stderr, "host memory allocation failed\n"); return 1; }
+        HIP_CHECK(hipMemcpy(h_B, d_B, total * sizeof(T), hipMemcpyDeviceToHost));
+        size_t bad = 0;
+        for (size_t i = 0; i < total; ++i) bad += !std::isfinite((double)h_B[i]);
+        free(h_B);
+        verify = bad ? "false" : "true";
+        if (bad) fprintf(stderr, "fma: verification failed: %zu of %zu results not finite\n", bad, total);
+    }
 
     // 4 multiply-adds per iteration, 2 operations each (mul + add).
     // For integers these are nominal operations, not necessarily 2 instructions.
@@ -175,18 +220,18 @@ static int run(double duration, long N, const char* precision) {
            "\"e_pci_bus_id\": \"%s\", "
            "\"a_gflop\": %.9g, \"a_gbyte\": %.9g, \"a_intensity\": %.9g, "
            "\"d_gflop_per_s\": %.9g, \"d_gbyte_per_s\": %.9g, "
-           "\"verify_ok\": null, "
+           "\"verify_ok\": %s, "
            "\"precision\": \"%s\", \"op_type\": \"%s\", "
            "\"e_blocks\": %d, \"e_threads\": %d, \"e_ops_per_element\": %ld}\n",
            elapsed, launches, unix_s(u0), unix_s(u1), mono_ns(t0), mono_ns(t1), pci,
            a_gflop, a_gbyte, a_intensity, a_gflop / elapsed, a_gbyte / elapsed,
-           precision, op_type, blocks, threads, N);
+           verify, precision, op_type, blocks, threads, N);
     fflush(stdout);
 
     HIP_CHECK(hipFree(d_A));
     HIP_CHECK(hipFree(d_B));
     free(h_A);
-    return 0;
+    return strcmp(verify, "false") ? 0 : 3;    // contract section 7: 3 = verification failed
 }
 
 // ---------------------------------------------------------------------------
