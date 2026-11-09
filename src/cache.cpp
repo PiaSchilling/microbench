@@ -2,41 +2,64 @@
 // benchmark=cache
 // level=1
 // component=GPU/Memory/Cache
-// description=Every block re-reads its own chunk of an array several times per launch (double); cache bandwidth (L1, L2) depending on the working set
+// description=Cache bandwidth kernel of the rocprof-compute roofline (all blocks re-read one buffer of cache size); L1, L2 or Infinity Cache
 // tags=memory-bound;bandwidth;cache
-// version=0.1.0
+// version=0.2.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
-// param.working_set_bytes=3735552|>= 8 x blocks (blocks = 4 x CUs)|Total size of the array; per CU it is working_set_bytes / CUs and decides which cache level serves the reads (L1 32 KiB per CU, L2 4 MiB per XCD)
-// param.passes=2000|>= 1|How often every block reads its chunk per launch; controls the kernel duration
+// param.level=l1|l1, l2, mall|Cache level: buffer of 32 KiB (L1), 4 MiB (L2) or 64 MiB (Infinity Cache), sizes for gfx942
+// param.passes=auto|auto or >= 1|How often every block reads the whole buffer per launch; auto = 100 (l1), 10 (l2), 1 (mall) as in rocprof-compute
 //
 // # Expectations (validation mode). To be confirmed with a disassembly (--save-temps).
-// # expect_isa=global_load_dwordx2
+// # expect_isa=global_load_dword
 // expect_counters=
 // ---- end metadata ----
 //
-// Why a separate benchmark: the L2 does not keep data across kernel launches
-// (validation finding 3), and stream reads every element only once per launch,
-// so stream can never measure L1 or L2. Here the reuse happens inside one launch.
+// Kernel Cache_bw: taken unchanged from the roofline benchmark of
+// rocprofiler-compute (ROCm Compute Profiler), github.com/ROCm/rocm-systems,
+// branch develop, commit 06cf5fb, projects/rocprofiler-compute/src/roofline/
+// benchmark/benchmark_base.py (kernel source there as a string, compiled with
+// hiprtc). Launch configuration as there: 256 threads per block, 128 blocks
+// per CU, float loads. Every block reads the WHOLE buffer `passes` times, so
+// the buffer (one cache size) is shared by all blocks of a CU/XCD.
 //
-// Kernel: the array is split into one chunk per block. Every block reads its
-// chunk `passes` times (coalesced: thread t reads elements t, t+256, t+512, ...)
-// and adds the values into four partial sums (four independent chains, so the
-// add latency does not limit). Only reads; every thread writes one result at
-// the end, so the compiler cannot remove the loads. A compiler barrier after
-// each pass forces the values to be loaded again instead of kept in registers.
+// Changes for this suite (contract docs/benchmark_contract.md): compiled
+// ahead of time instead of hiprtc; time loop over --duration with ROI time
+// stamps and JSON output; argument check; the buffer is initialized (in
+// rocprof-compute it is summed uninitialized); no verification (all blocks
+// write the same result array, verify_ok = null).
 //
-// A block stays on one CU during the launch, so its chunk lives in the caches
-// of that CU and XCD. With blocks = 4 x CUs, every CU holds about
-// working_set_bytes / CUs:
-//   - L1:  working set per CU <= 32 KiB        (default: 16 KiB per CU on 228 CUs)
-//   - L2:  working set per XCD <= 4 MiB, but > L1
-// Which level actually serves the reads is checked with the counters
-// (L1: almost no TCP->TCC requests; L2: TCC hits, almost no reads beyond L2).
+// Replaces cache 0.1.0 (own kernel: every block read its own chunk, 4 blocks
+// per CU, double): it reached only ~14 TB/s for both L1 and L2, probably too
+// few blocks per CU (validation finding 14).
 //
-// Interface: docs/benchmark_contract.md.
+// ---------------------------------------------------------------------------
+// License of the kernel Cache_bw (rocprofiler-compute):
+//
+// MIT License
+//
+// Copyright (C) Advanced Micro Devices, Inc.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// ---------------------------------------------------------------------------
 
 #include <hip/hip_runtime.h>
 #include <cerrno>
@@ -46,8 +69,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-
-#define DATA_TYPE double
 
 #define HIP_CHECK(call)                                                        \
     do {                                                                       \
@@ -59,31 +80,57 @@
         }                                                                      \
     } while (0)
 
-static const int THREADS = 256;      // threads per block
-static const int BLOCKS_PER_CU = 4;  // 16 wavefronts per CU
+static const int WORKGROUP_SIZE = 256;   // as in rocprof-compute
+static const int BLOCKS_PER_CU = 128;    // as in rocprof-compute
+
+// Buffer sizes for gfx942 (rocprof-compute: L1 32 KiB, L2 4 MiB, MALL 64 MiB)
+static const int L1_SIZE   = 32 * 1024;
+static const int L2_SIZE   = 4 * 1024 * 1024;
+static const int MALL_SIZE = 64 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// Kernel
+// Kernel (rocprofiler-compute, MIT license, see header) -- unchanged
 // ---------------------------------------------------------------------------
 
-__global__ void read_chunk(const DATA_TYPE* A, DATA_TYPE* B, size_t chunk, long passes) {
-    const size_t begin = (size_t)blockIdx.x * chunk;   // first element of this block's chunk
-    const size_t end   = begin + chunk;
-    const size_t step  = blockDim.x;
+template <typename T, int cacheSize, int workgroup_size>
+__global__ void Cache_bw(const T *memBlock, T *dummy, int numIter)
+{
+const int thread_id = threadIdx.x;
+constexpr int cache_count = cacheSize / sizeof(T);
 
-    DATA_TYPE s0 = 0, s1 = 0, s2 = 0, s3 = 0;
-    for (long p = 0; p < passes; ++p) {
-        size_t j = begin + threadIdx.x;
-        for (; j + 3 * step < end; j += 4 * step) {    // four elements per step, four chains
-            s0 += A[j];
-            s1 += A[j + step];
-            s2 += A[j + 2 * step];
-            s3 += A[j + 3 * step];
-        }
-        for (; j < end; j += step) s0 += A[j];          // rest of the chunk
-        __asm__ volatile("" ::: "memory");               // load again in the next pass
+T sink;
+
+sink = 0;
+for (int iter = 0; iter < numIter; ++iter)
+{
+#pragma unroll 32
+    for (int i = 0; i < cache_count; i += workgroup_size)
+    {
+    // if the size of the memory block is small (e.g., the size
+    // of L1), then we need a slightly more complicated index
+    // calculation. Otherwise, the compiler holds all the loads
+    // in the inner loop in registers upon the first pass of the
+    // outer loop, and it doesn't do the loads upon subsequent
+    // passes of the outer loop.
+    // OTOH, if the size of the memory block is larger (such as L2
+    // size), experimentation showed that the overhead of the more
+    // complicated index calculation has a noticeable effect on BW,
+    // so we use a simpler index expression instead. This works since
+    // for larger memory blocks, the compiler cannot hold the loads
+    // of the inner loop in registers anymore, as it can with L1-sized
+    // buffers.
+    if constexpr (cache_count / workgroup_size <= 32)
+    {
+        sink += memBlock[(thread_id + i + iter) % cache_count];
     }
-    B[(size_t)blockIdx.x * blockDim.x + threadIdx.x] = s0 + s1 + s2 + s3;
+    else
+    {
+        sink += memBlock[thread_id + i];
+    }
+    }
+}
+
+dummy[thread_id] = sink;
 }
 
 // ---------------------------------------------------------------------------
@@ -109,25 +156,22 @@ static bool parse_double(const char* s, double* out) {
     return true;
 }
 
-static bool parse_ull(const char* s, unsigned long long* out) {
-    if (*s == '-') return false;
+static bool parse_long(const char* s, long* out) {
     char* end;
     errno = 0;
-    unsigned long long v = strtoull(s, &end, 10);
+    long v = strtol(s, &end, 10);
     if (errno || end == s || *end != '\0') return false;
     *out = v;
     return true;
 }
 
-// Input values: small integers (0..15), so all sums are exact in double and
-// the result can be verified exactly.
-static DATA_TYPE value(size_t i) { return (DATA_TYPE)(i % 16); }
+typedef void (*cache_kernel_t)(const float*, float*, int);
 
 int main(int argc, char** argv) {
     double duration = 0;
-    unsigned long long ws_bytes = 3735552;   // 16 KiB per CU on 228 CUs
-    unsigned long long passes = 2000;
-    bool check = false, have_duration = false, have_ws = false, have_passes = false;
+    const char* level = "l1";
+    long passes = 0;                         // 0 = auto
+    bool check = false, have_duration = false, have_level = false, have_passes = false;
 
     // ---- arguments (contract section 4) ----
     for (int i = 1; i < argc; ++i) {
@@ -142,19 +186,21 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "cache: --duration must be a number > 0 (got '%s')\n", val);
                 return 1;
             }
-        } else if (!strcmp(key, "--working_set_bytes")) {
-            if (have_ws) { fprintf(stderr, "cache: --working_set_bytes given twice\n"); return 1; }
-            have_ws = true;
-            if (!parse_ull(val, &ws_bytes) || ws_bytes < sizeof(DATA_TYPE)) {
-                fprintf(stderr, "cache: --working_set_bytes must be an integer >= %zu (got '%s')\n",
-                        sizeof(DATA_TYPE), val);
+        } else if (!strcmp(key, "--level")) {
+            if (have_level) { fprintf(stderr, "cache: --level given twice\n"); return 1; }
+            have_level = true;
+            if (strcmp(val, "l1") && strcmp(val, "l2") && strcmp(val, "mall")) {
+                fprintf(stderr, "cache: --level must be l1, l2 or mall (got '%s')\n", val);
                 return 1;
             }
+            level = val;
         } else if (!strcmp(key, "--passes")) {
             if (have_passes) { fprintf(stderr, "cache: --passes given twice\n"); return 1; }
             have_passes = true;
-            if (!parse_ull(val, &passes) || passes < 1 || passes > 1000000000ULL) {
-                fprintf(stderr, "cache: --passes must be an integer between 1 and 1e9 (got '%s')\n", val);
+            if (!strcmp(val, "auto")) {
+                passes = 0;
+            } else if (!parse_long(val, &passes) || passes < 1 || passes > 1000000) {
+                fprintf(stderr, "cache: --passes must be auto or an integer between 1 and 1000000 (got '%s')\n", val);
                 return 1;
             }
         } else {
@@ -164,7 +210,19 @@ int main(int argc, char** argv) {
     }
     if (!have_duration) { fprintf(stderr, "cache: --duration is required\n"); return 1; }
     if (check) return 0;                       // arguments valid, no GPU access
-                                               // (minimum size needs the CU count, checked below)
+
+    // ---- level -> kernel, buffer size, default passes (as in rocprof-compute) ----
+    cache_kernel_t kernel;
+    size_t cache_size;
+    long auto_passes;
+    if (!strcmp(level, "l1")) {
+        kernel = Cache_bw<float, L1_SIZE, WORKGROUP_SIZE>;   cache_size = L1_SIZE;   auto_passes = 100;
+    } else if (!strcmp(level, "l2")) {
+        kernel = Cache_bw<float, L2_SIZE, WORKGROUP_SIZE>;   cache_size = L2_SIZE;   auto_passes = 10;
+    } else {
+        kernel = Cache_bw<float, MALL_SIZE, WORKGROUP_SIZE>; cache_size = MALL_SIZE; auto_passes = 1;
+    }
+    if (passes == 0) passes = auto_passes;
 
     // ---- setup ----
     hipDeviceProp_t prop;
@@ -175,28 +233,21 @@ int main(int argc, char** argv) {
 
     const unsigned cus = (unsigned)prop.multiProcessorCount;
     const unsigned blocks = BLOCKS_PER_CU * cus;
-    const size_t chunk = (size_t)(ws_bytes / sizeof(DATA_TYPE)) / blocks;   // elements per block
-    if (chunk == 0) {
-        fprintf(stderr, "cache: --working_set_bytes too small: at least %zu bytes (8 B x %u blocks)\n",
-                sizeof(DATA_TYPE) * blocks, blocks);
-        return 1;
-    }
-    const size_t n = chunk * blocks;                   // effective elements (truncated)
-    const size_t ws_eff = n * sizeof(DATA_TYPE);
-    const size_t total_threads = (size_t)blocks * THREADS;
-    fprintf(stderr, "cache: device %s (%s), working set %zu B (%.1f KiB per CU), chunk %zu elements, "
-            "blocks=%u threads=%d passes=%llu\n",
-            prop.name, pci, ws_eff, (double)ws_eff / cus / 1024.0, chunk, blocks, THREADS, passes);
+    fprintf(stderr, "cache: device %s (%s), level=%s buffer=%zu B, blocks=%u threads=%d passes=%ld\n",
+            prop.name, pci, level, cache_size, blocks, WORKGROUP_SIZE, passes);
 
-    std::vector<DATA_TYPE> h_A(n);
-    for (size_t i = 0; i < n; ++i) h_A[i] = value(i);
-    DATA_TYPE *d_A, *d_B;
-    HIP_CHECK(hipMalloc(&d_A, n * sizeof(DATA_TYPE)));
-    HIP_CHECK(hipMalloc(&d_B, total_threads * sizeof(DATA_TYPE)));
-    HIP_CHECK(hipMemcpy(d_A, h_A.data(), n * sizeof(DATA_TYPE), hipMemcpyHostToDevice));
+    // Buffer initialized with small values (rocprof-compute sums uninitialized memory)
+    const size_t n = cache_size / sizeof(float);
+    std::vector<float> h_A(n);
+    for (size_t i = 0; i < n; ++i) h_A[i] = (float)(i % 16);
+    float *d_A, *d_dummy;
+    HIP_CHECK(hipMalloc(&d_A, cache_size));
+    HIP_CHECK(hipMalloc(&d_dummy, WORKGROUP_SIZE * sizeof(float)));
+    HIP_CHECK(hipMemcpy(d_A, h_A.data(), cache_size, hipMemcpyHostToDevice));
 
     // Warmup (not part of the ROI)
-    hipLaunchKernelGGL(read_chunk, dim3(blocks), dim3(THREADS), 0, 0, d_A, d_B, chunk, (long)passes);
+    hipLaunchKernelGGL(kernel, dim3(blocks), dim3(WORKGROUP_SIZE), 0, 0,
+                       (const float*)d_A, d_dummy, (int)passes);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -207,7 +258,8 @@ int main(int argc, char** argv) {
     mono_clock::time_point t1;
     double elapsed;
     do {
-        hipLaunchKernelGGL(read_chunk, dim3(blocks), dim3(THREADS), 0, 0, d_A, d_B, chunk, (long)passes);
+        hipLaunchKernelGGL(kernel, dim3(blocks), dim3(WORKGROUP_SIZE), 0, 0,
+                           (const float*)d_A, d_dummy, (int)passes);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
         ++launches;
@@ -216,50 +268,30 @@ int main(int argc, char** argv) {
     } while (elapsed < duration);
     const unix_clock::time_point u1 = unix_clock::now();
 
-    // ---- verification (after the ROI): every thread's sum, exact ----
-    std::vector<DATA_TYPE> h_B(total_threads);
-    HIP_CHECK(hipMemcpy(h_B.data(), d_B, total_threads * sizeof(DATA_TYPE), hipMemcpyDeviceToHost));
-    size_t bad = 0;
-    for (size_t b = 0; b < blocks; ++b) {
-        for (size_t t = 0; t < (size_t)THREADS; ++t) {
-            double s = 0;
-            for (size_t j = b * chunk + t; j < (b + 1) * chunk; j += THREADS) s += (double)h_A[j];
-            const double expected = s * (double)passes;
-            if ((double)h_B[b * THREADS + t] != expected) {
-                if (bad == 0)
-                    fprintf(stderr, "cache: verification failed at block %zu thread %zu: %g, expected %g\n",
-                            b, t, (double)h_B[b * THREADS + t], expected);
-                ++bad;
-            }
-        }
-    }
-    const bool ok = (bad == 0);
-
     // ---- results; GB = 10^9 byte ----
-    // Reads: passes x working set per launch; writes: one value per thread.
-    const double reads  = (double)launches * passes * ws_eff;
-    const double writes = (double)launches * total_threads * sizeof(DATA_TYPE);
-    const double a_gbyte = (reads + writes) / 1e9;
-    const double a_gflop = (double)launches * passes * n / 1e9;     // one add per element read
+    // As in rocprof-compute: every block reads the whole buffer `passes` times
+    // (the final store of 256 floats per block is negligible and not counted).
+    const double a_gbyte = (double)launches * blocks * passes * cache_size / 1e9;
+    const double a_gflop = (double)launches * blocks * passes * n / 1e9;    // one add per float read
     const double a_intensity = a_gflop / a_gbyte;
 
-    fprintf(stderr, "cache: %ld launches  %.3f s  %.1f GB/s\n", launches, elapsed, a_gbyte / elapsed);
+    fprintf(stderr, "cache: level=%s  %ld launches  %.3f s  %.1f GB/s\n",
+            level, launches, elapsed, a_gbyte / elapsed);
     printf("{\"runtime_s\": %.9f, \"iterations\": %ld, "
            "\"roi_start_unix\": %.6f, \"roi_end_unix\": %.6f, "
            "\"roi_start_mono_ns\": %lld, \"roi_end_mono_ns\": %lld, "
            "\"e_pci_bus_id\": \"%s\", "
            "\"a_gflop\": %.9g, \"a_gbyte\": %.9g, \"a_intensity\": %.9g, "
            "\"d_gflop_per_s\": %.9g, \"d_gbyte_per_s\": %.9g, "
-           "\"verify_ok\": %s, "
-           "\"e_working_set_bytes\": %zu, \"e_working_set_bytes_per_cu\": %.1f, \"e_chunk_elements\": %zu, "
-           "\"e_passes\": %llu, \"e_blocks\": %u, \"e_threads\": %d}\n",
+           "\"verify_ok\": null, "
+           "\"cache_level\": \"%s\", \"e_buffer_bytes\": %zu, \"e_passes\": %ld, "
+           "\"e_blocks\": %u, \"e_threads\": %d}\n",
            elapsed, launches, unix_s(u0), unix_s(u1), mono_ns(t0), mono_ns(t1), pci,
            a_gflop, a_gbyte, a_intensity, a_gflop / elapsed, a_gbyte / elapsed,
-           ok ? "true" : "false",
-           ws_eff, (double)ws_eff / cus, chunk, passes, blocks, THREADS);
+           level, cache_size, passes, blocks, WORKGROUP_SIZE);
     fflush(stdout);
 
     HIP_CHECK(hipFree(d_A));
-    HIP_CHECK(hipFree(d_B));
-    return ok ? 0 : 3;
+    HIP_CHECK(hipFree(d_dummy));
+    return 0;
 }
