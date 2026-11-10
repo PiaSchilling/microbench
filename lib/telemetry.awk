@@ -17,6 +17,10 @@
 #     m_avg_power_w           m_energy_j / (t1 - t0)
 #     m_ppt_viol_pct          100 * delta ppt_residency_acc / delta acc_counter (power limit)
 #     m_thm_viol_pct          same with thm_residency_acc (thermal limit)
+#   If acc_counter is not reported (empty; seen on some nodes, 2026-11-10), the
+#   reference is the ROI length in ticks of ACC_TICK_MS (1 ms): the residency
+#   counters count 1 per ms while the limit is active (checked: fma_fp64 97 %,
+#   fma_fp32 92 %, fma_fp16 9 % this way vs. 96.9 / 91.7 / 8.7 % with acc_counter).
 #   Instantaneous values are averaged over the samples inside the window:
 #     m_telemetry_samples, m_avg_power_sampled_w, m_avg_gfx_clk_mhz, m_min_gfx_clk_mhz,
 #     m_max_gfx_clk_mhz, m_avg_mem_clk_mhz, m_max_temp_c, m_max_temp_mem_c,
@@ -24,6 +28,7 @@
 #   Values that cannot be computed are null.
 
 BEGIN {
+    ACC_TICK_MS = 1
     if (timecol == "") timecol = "mono_ns"
     t0 += 0; t1 += 0
     if (header != "") set_header(header)
@@ -113,6 +118,7 @@ END {
         b = order[g]
         e = delta(b, "energy_j")
         acc = delta(b, "acc_counter")
+        if (acc == "" || acc <= 0) acc = (t1 - t0) / 1e6 / ACC_TICK_MS   # fallback, see header
         ppt = delta(b, "ppt_residency_acc")
         thm = delta(b, "thm_residency_acc")
         out = "{" jstr("bdf") ":" jstr(b)

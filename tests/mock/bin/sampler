@@ -13,6 +13,7 @@
 #   silent     run, but never write a sample
 #   otherbdf   report only 0000:42:00.0
 #   badheader  write an unexpected header (rows are written as usual)
+#   noacc      acc_counter empty (not reported by the firmware)
 
 interval=100 out=/dev/stdout
 while (($#)); do
@@ -53,7 +54,7 @@ while ((!stop)); do
         # does not filter by PCI address picks the wrong values
         rows="$mono,$now,0000:42:00.0,1000,$ms,100,$((e2 / 1000)).$(printf '%03d' $((e2 % 1000))),1000.0,1000,1000,1300,40,35,0,0,$ms,0,"$'\n'
         [[ $mode == otherbdf ]] ||
-            rows+="$mono,$now,0000:01:00.0,1000,$ms,400,$((e1 / 1000)).$(printf '%03d' $((e1 % 1000))),2000.0,1900,2100,1300,70,60,100,5,$ms,$((ms / 4)),"$'\n'
+            rows+="$mono,$now,0000:01:00.0,1000,$ms,400,$((e1 / 1000)).$(printf '%03d' $((e1 % 1000))),2000.0,1900,2100,1300,70,60,100,5,$([[ $mode == noacc ]] || echo $ms),$((ms / 4)),"$'\n'
         printf '%s' "$rows" >>"$out"
     fi
     if [[ $mode == die ]] && ((el > 300000000)); then

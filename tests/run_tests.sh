@@ -804,6 +804,12 @@ test_telemetry_throttling_share() {
     check_record a 1 '"m_thm_viol_pct":null'
 }
 
+register telemetry_throttling_without_acc_counter
+test_telemetry_throttling_without_acc_counter() {
+    MOCK_SAMPLER=noacc telemetry_run          # residency 1 per 4 ms, reference = ROI time
+    check_num a 1 m_ppt_viol_pct 25 3
+}
+
 register telemetry_throttling_note
 test_telemetry_throttling_note() {
     telemetry_run                               # mock: 25 % power throttling, 2000 MHz
