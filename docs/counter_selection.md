@@ -38,7 +38,7 @@ What the validation mode should show if a benchmark does what it claims (to be c
 | Benchmark | Expected signature |
 |---|---|
 | `fma` (fp64) | `SQ_INSTS_VALU_FMA_F64` dominates `SQ_INSTS_VALU`; high `SQ_ACTIVE_INST_VALU`; almost no `TCP_*`/`TCC_*` traffic |
-| `stream` | few VALU instructions; `SQ_INSTS_VMEM_RD` ≈ `SQ_INSTS_VMEM_WR`; high `TCC_EA0_RDREQ_DRAM_sum` and `TCC_EA0_WRREQ_DRAM_sum` (working set >> LLC) |
+| `copy` (formerly `stream`) | few VALU instructions; `SQ_INSTS_VMEM_RD` ≈ `SQ_INSTS_VMEM_WR`; high `TCC_EA0_RDREQ_DRAM_sum` and `TCC_EA0_WRREQ_DRAM_sum` (working set >> LLC) |
 | `chase` | one wavefront; very low `SQ_ACTIVE_INST_*`; L2 hit rate depends on the working set (high for `chase_l1`/`chase_l2`, low for `chase_hbm`); `TCP_UTCL1_TRANSLATION_MISS_sum` grows with the working set |
 | `gemm` (blocked) | `SQ_INSTS_LDS` and `SQ_LDS_IDX_ACTIVE` > 0, FMA/MUL+ADD of the input precision; L2/fabric traffic falls with growing K (arithmetic intensity) |
 | `gemm` (naive) | no LDS; much more `TCP_*`/`TCC_*` traffic than blocked at the same size |

@@ -35,7 +35,7 @@
 //
 // Named "cache" until 2026-11-10 (renamed: too similar to "chase", and the
 // only benchmark named after its component; "reuse" names the access pattern,
-// the difference to stream). Kernel and behaviour unchanged.
+// the difference to copy, formerly stream). Kernel and behaviour unchanged.
 //
 // Replaces cache 0.1.0 (own kernel: every block read its own chunk, 4 blocks
 // per CU, double): it reached only ~14 TB/s for both L1 and L2, probably too

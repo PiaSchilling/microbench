@@ -1,8 +1,8 @@
 // ---- benchmark metadata ----
-// benchmark=stream
+// benchmark=copy
 // level=1
 // component=GPU/Memory/Bandwidth
-// description=Copy kernel B[i] = A[i] (double); bandwidth pole of the design space
+// description=Copy kernel B[i] = A[i] (double), as the Copy kernel of STREAM (McCalpin) / BabelStream; bandwidth pole of the design space
 // tags=memory-bound;bandwidth
 // version=0.3.0
 // extra_build_flags=
@@ -15,6 +15,10 @@
 // # expect_isa=global_load_dwordx2;global_store_dwordx2
 // expect_counters=
 // ---- end metadata ----
+//
+// Named "stream" until 2026-11-10 (renamed: it is only the Copy kernel of
+// STREAM, not the full STREAM benchmark with Copy, Scale, Add, Triad).
+// Behaviour unchanged.
 //
 // One thread per element copies A to B. 100 launches per synchronization, so that
 // the launch overhead does not dominate for small arrays. Interface:
@@ -85,30 +89,30 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const char* key = argv[i];
         if (!strcmp(key, "--check")) { check = true; continue; }
-        if (i + 1 >= argc) { fprintf(stderr, "stream: option %s requires a value\n", key); return 1; }
+        if (i + 1 >= argc) { fprintf(stderr, "copy: option %s requires a value\n", key); return 1; }
         const char* val = argv[++i];
         if (!strcmp(key, "--duration")) {
-            if (have_duration) { fprintf(stderr, "stream: --duration given twice\n"); return 1; }
+            if (have_duration) { fprintf(stderr, "copy: --duration given twice\n"); return 1; }
             have_duration = true;
             if (!parse_double(val, &duration) || duration <= 0) {
-                fprintf(stderr, "stream: --duration must be a number > 0 (got '%s')\n", val);
+                fprintf(stderr, "copy: --duration must be a number > 0 (got '%s')\n", val);
                 return 1;
             }
         } else if (!strcmp(key, "--elements")) {
-            if (have_elements) { fprintf(stderr, "stream: --elements given twice\n"); return 1; }
+            if (have_elements) { fprintf(stderr, "copy: --elements given twice\n"); return 1; }
             have_elements = true;
             if (!parse_ull(val, &elements) || elements == 0 || elements % threads != 0) {
-                fprintf(stderr, "stream: --elements must be an integer > 0 and divisible by %d (got '%s')\n",
+                fprintf(stderr, "copy: --elements must be an integer > 0 and divisible by %d (got '%s')\n",
                         threads, val);
                 return 1;
             }
         } else {
-            fprintf(stderr, "stream: unknown option %s\n", key);
+            fprintf(stderr, "copy: unknown option %s\n", key);
             return 1;
         }
     }
-    if (!have_duration) { fprintf(stderr, "stream: --duration is required\n"); return 1; }
-    if (elements / threads > 0xFFFFFFFFull) { fprintf(stderr, "stream: --elements too large for the grid\n"); return 1; }
+    if (!have_duration) { fprintf(stderr, "copy: --duration is required\n"); return 1; }
+    if (elements / threads > 0xFFFFFFFFull) { fprintf(stderr, "copy: --elements too large for the grid\n"); return 1; }
     if (check) return 0;                       // arguments valid, no GPU access
 
     // ---- setup ----
@@ -121,7 +125,7 @@ int main(int argc, char** argv) {
     const size_t n = (size_t)elements;
     const unsigned blocks = (unsigned)(n / threads);   // one element per thread
     const int batch = 100;                             // launches per synchronization
-    fprintf(stderr, "stream: device %s (%s), elements=%zu blocks=%u threads=%d\n",
+    fprintf(stderr, "copy: device %s (%s), elements=%zu blocks=%u threads=%d\n",
             prop.name, pci, n, blocks, threads);
 
     DATA_TYPE *d_A, *d_B;
@@ -162,7 +166,7 @@ int main(int argc, char** argv) {
         DATA_TYPE got;
         HIP_CHECK(hipMemcpy(&got, d_B + idx, sizeof(DATA_TYPE), hipMemcpyDeviceToHost));
         if (got != h_A[idx]) {
-            fprintf(stderr, "stream: verification failed at element %zu: B=%g, expected %g\n",
+            fprintf(stderr, "copy: verification failed at element %zu: B=%g, expected %g\n",
                     idx, (double)got, (double)h_A[idx]);
             ok = false;
         }
@@ -173,7 +177,7 @@ int main(int argc, char** argv) {
     const double a_gbyte = (double)launches * n * 2 * sizeof(DATA_TYPE) / 1e9;  // 1 load + 1 store
     const double a_intensity = a_gflop / a_gbyte;                               // 0
 
-    fprintf(stderr, "stream: elements=%zu  %ld launches  %.3f s  %.1f GB/s\n",
+    fprintf(stderr, "copy: elements=%zu  %ld launches  %.3f s  %.1f GB/s\n",
             n, launches, elapsed, a_gbyte / elapsed);
     printf("{\"runtime_s\": %.9f, \"iterations\": %ld, "
            "\"roi_start_unix\": %.6f, \"roi_end_unix\": %.6f, "

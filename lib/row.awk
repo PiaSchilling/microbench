@@ -13,7 +13,7 @@ BEGIN {
                       "d_gbyte_per_s_mean d_gbyte_per_s_cv m_avg_power_w_mean", cols, " ")
     else
         ncols = split("label rep benchmark device status runtime_s d_gflop_per_s d_gbyte_per_s " \
-                      "m_avg_power_w", cols, " ")
+                      "m_avg_power_w m_ppt_viol_pct m_avg_gfx_clk_mhz", cols, " ")
     if (header) {
         line = ""
         for (c = 1; c <= ncols; c++) {

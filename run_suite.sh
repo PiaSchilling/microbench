@@ -851,6 +851,23 @@ run_passes() {
     printf '%s' "$rows" >>"$RESDIR/counters.csv"
 }
 
+# throttle_note: after a run, point out power throttling (from the telemetry of pass 0)
+# when the GPU was at the power limit for more than THROTTLE_WARN_PCT % of the ROI;
+# then the hardware limited the run, not the kernel (clock below max_sclk).
+THROTTLE_WARN_PCT=5
+throttle_note() {
+    local ppt clk re='"m_ppt_viol_pct":([0-9.eE+-]+)' re2='"m_avg_gfx_clk_mhz":([0-9.eE+-]+)'
+    [[ $MFRAG =~ $re ]] || return 0
+    ppt=${BASH_REMATCH[1]}
+    clk="?"
+    [[ $MFRAG =~ $re2 ]] && clk=$(awk -v v="${BASH_REMATCH[1]}" 'BEGIN { printf "%.0f", v }')
+    awk -v v="$ppt" -v t="$THROTTLE_WARN_PCT" 'BEGIN { exit !(v > t) }' || return 0
+    ppt=$(awk -v v="$ppt" 'BEGIN { printf "%.0f", v }')
+    printf '%*s-> throttled at the power limit in %s %% of the ROI, avg clock %s MHz\n' \
+        $((LW + 2)) '' "$ppt" "$clk" >&2
+    log "       throttled at the power limit in $ppt % of the ROI, avg clock $clk MHz"
+}
+
 # run_one <round> <index>: execute one run, write its record; sets RAN=1 if executed
 run_one() {
     local r=$1 i=$2
@@ -963,6 +980,7 @@ run_one() {
         -f "$LIB/json.awk" -f "$LIB/row.awk"
 
     log "RUN    $label rep $r: $status${reason:+ ($reason)}"
+    throttle_note
     if [[ $status != ok ]]; then
         log "       $cmd"
         printf '%*s-> %s\n' $((LW + 2)) '' "$reason" >&2

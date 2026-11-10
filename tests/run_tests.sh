@@ -804,6 +804,13 @@ test_telemetry_throttling_share() {
     check_record a 1 '"m_thm_viol_pct":null'
 }
 
+register telemetry_throttling_note
+test_telemetry_throttling_note() {
+    telemetry_run                               # mock: 25 % power throttling, 2000 MHz
+    check_contains "$CDIR/err" "throttled at the power limit in 2"   # ~25 %, sampled
+    check_contains "$CDIR/err" "of the ROI, avg clock 2000 MHz"
+}
+
 register telemetry_samples_counted
 test_telemetry_samples_counted() {
     telemetry_run
