@@ -1,8 +1,8 @@
 // ---- benchmark metadata ----
-// benchmark=cache
+// benchmark=reuse
 // level=1
 // component=GPU/Memory/Cache
-// description=Cache bandwidth kernel of the rocprof-compute roofline (all blocks re-read one buffer of cache size); L1, L2 or LLC (Infinity Cache)
+// description=Reuse within a kernel: all blocks re-read one buffer of cache size (cache bandwidth kernel of the rocprof-compute roofline); L1, L2 or LLC (Infinity Cache)
 // tags=memory-bound;bandwidth;cache
 // version=0.2.0
 // extra_build_flags=
@@ -32,6 +32,10 @@
 // write the same result array, verify_ok = null). The last level cache is
 // called llc here, as in the rest of the suite (component config llc_bytes);
 // AMD calls it MALL (Memory Attached Last Level cache).
+//
+// Named "cache" until 2026-11-10 (renamed: too similar to "chase", and the
+// only benchmark named after its component; "reuse" names the access pattern,
+// the difference to stream). Kernel and behaviour unchanged.
 //
 // Replaces cache 0.1.0 (own kernel: every block read its own chunk, 4 blocks
 // per CU, double): it reached only ~14 TB/s for both L1 and L2, probably too
@@ -167,7 +171,7 @@ static bool parse_long(const char* s, long* out) {
     return true;
 }
 
-typedef void (*cache_kernel_t)(const float*, float*, int);
+typedef void (*reuse_kernel_t)(const float*, float*, int);
 
 int main(int argc, char** argv) {
     double duration = 0;
@@ -179,42 +183,42 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         const char* key = argv[i];
         if (!strcmp(key, "--check")) { check = true; continue; }
-        if (i + 1 >= argc) { fprintf(stderr, "cache: option %s requires a value\n", key); return 1; }
+        if (i + 1 >= argc) { fprintf(stderr, "reuse: option %s requires a value\n", key); return 1; }
         const char* val = argv[++i];
         if (!strcmp(key, "--duration")) {
-            if (have_duration) { fprintf(stderr, "cache: --duration given twice\n"); return 1; }
+            if (have_duration) { fprintf(stderr, "reuse: --duration given twice\n"); return 1; }
             have_duration = true;
             if (!parse_double(val, &duration) || duration <= 0) {
-                fprintf(stderr, "cache: --duration must be a number > 0 (got '%s')\n", val);
+                fprintf(stderr, "reuse: --duration must be a number > 0 (got '%s')\n", val);
                 return 1;
             }
         } else if (!strcmp(key, "--level")) {
-            if (have_level) { fprintf(stderr, "cache: --level given twice\n"); return 1; }
+            if (have_level) { fprintf(stderr, "reuse: --level given twice\n"); return 1; }
             have_level = true;
             if (strcmp(val, "l1") && strcmp(val, "l2") && strcmp(val, "llc")) {
-                fprintf(stderr, "cache: --level must be l1, l2 or llc (got '%s')\n", val);
+                fprintf(stderr, "reuse: --level must be l1, l2 or llc (got '%s')\n", val);
                 return 1;
             }
             level = val;
         } else if (!strcmp(key, "--passes")) {
-            if (have_passes) { fprintf(stderr, "cache: --passes given twice\n"); return 1; }
+            if (have_passes) { fprintf(stderr, "reuse: --passes given twice\n"); return 1; }
             have_passes = true;
             if (!strcmp(val, "auto")) {
                 passes = 0;
             } else if (!parse_long(val, &passes) || passes < 1 || passes > 1000000) {
-                fprintf(stderr, "cache: --passes must be auto or an integer between 1 and 1000000 (got '%s')\n", val);
+                fprintf(stderr, "reuse: --passes must be auto or an integer between 1 and 1000000 (got '%s')\n", val);
                 return 1;
             }
         } else {
-            fprintf(stderr, "cache: unknown option %s\n", key);
+            fprintf(stderr, "reuse: unknown option %s\n", key);
             return 1;
         }
     }
-    if (!have_duration) { fprintf(stderr, "cache: --duration is required\n"); return 1; }
+    if (!have_duration) { fprintf(stderr, "reuse: --duration is required\n"); return 1; }
     if (check) return 0;                       // arguments valid, no GPU access
 
     // ---- level -> kernel, buffer size, default passes (as in rocprof-compute) ----
-    cache_kernel_t kernel;
+    reuse_kernel_t kernel;
     size_t cache_size;
     long auto_passes;
     if (!strcmp(level, "l1")) {
@@ -235,7 +239,7 @@ int main(int argc, char** argv) {
 
     const unsigned cus = (unsigned)prop.multiProcessorCount;
     const unsigned blocks = BLOCKS_PER_CU * cus;
-    fprintf(stderr, "cache: device %s (%s), level=%s buffer=%zu B, blocks=%u threads=%d passes=%ld\n",
+    fprintf(stderr, "reuse: device %s (%s), level=%s buffer=%zu B, blocks=%u threads=%d passes=%ld\n",
             prop.name, pci, level, cache_size, blocks, WORKGROUP_SIZE, passes);
 
     // Buffer initialized with small values (rocprof-compute sums uninitialized memory)
@@ -277,7 +281,7 @@ int main(int argc, char** argv) {
     const double a_gflop = (double)launches * blocks * passes * n / 1e9;    // one add per float read
     const double a_intensity = a_gflop / a_gbyte;
 
-    fprintf(stderr, "cache: level=%s  %ld launches  %.3f s  %.1f GB/s\n",
+    fprintf(stderr, "reuse: level=%s  %ld launches  %.3f s  %.1f GB/s\n",
             level, launches, elapsed, a_gbyte / elapsed);
     printf("{\"runtime_s\": %.9f, \"iterations\": %ld, "
            "\"roi_start_unix\": %.6f, \"roi_end_unix\": %.6f, "
