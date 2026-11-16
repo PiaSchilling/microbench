@@ -23,28 +23,12 @@
 // expect_counters=
 // ---- end metadata ----
 //
-// Kernels mfma_*: taken unchanged from the roofline benchmark of
-// rocprofiler-compute (ROCm Compute Profiler), github.com/ROCm/rocm-systems,
-// branch develop, commit 06cf5fb, projects/rocprofiler-compute/src/roofline/
-// benchmark/gfx9/benchmark_gfx9_base.py (fp32, fp64) and
-// gfx9/benchmark_gfx942.py (fp16, bf16, int8, fp8); launch configuration and
-// FLOP count from benchmark_base.py (matrix_bench): 256 threads per block,
-// 128 blocks per CU, 2000 iterations,
-//   FLOP = blocks * (256 / 64) * iters * ops_per_instruction,
-//   ops_per_instruction = 2 * M * N * K of the instruction (table MATRIX_OPS).
-//
-// Each wavefront runs ONE dependent chain result = A*B + result. The operands
-// are constant (threadIdx.x) for the whole run; only the accumulator changes.
-// So few bits toggle in the inputs, and the power draw is probably lower than
-// with changing data (validation finding 12). Kept as in rocprof-compute for
-// now, to compare with its roofline peak.
-//
-// Changes for this suite (contract docs/benchmark_contract.md): compiled
-// ahead of time instead of hiprtc; kernel names without extern "C"; time loop
-// over --duration with ROI time stamps and JSON output; argument check; no
-// verification (the store happens only if result[0] != 2*result[0], i.e. it
-// only prevents dead-code elimination; verify_ok = null). fp8 on gfx942 is
-// the "fnuz" variant of fp8 (AMD comment in benchmark_gfx942.py).
+// mfma: every wavefront runs one dependent chain of matrix multiply-adds
+// (v_mfma_*) on the Matrix Cores. Measures peak Matrix Core throughput per
+// precision.
+// Source: mfma_* kernels of the rocprof-compute roofline (MIT, see below).
+// Details: docs/benchmarks.md#mfma
+// Interface: docs/benchmark_contract.md
 //
 // ---------------------------------------------------------------------------
 // License of the kernels mfma_* (rocprofiler-compute):

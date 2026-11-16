@@ -16,13 +16,11 @@
 // expect_counters=
 // ---- end metadata ----
 //
-// Named "stream" until 2026-11-10 (renamed: it is only the Copy kernel of
-// STREAM, not the full STREAM benchmark with Copy, Scale, Add, Triad).
-// Behaviour unchanged.
-//
-// One thread per element copies A to B. 100 launches per synchronization, so that
-// the launch overhead does not dominate for small arrays. Interface:
-// docs/benchmark_contract.md.
+// copy: one thread per element copies array A to array B (B[i] = A[i], double),
+// no computation. Measures HBM bandwidth (read + write).
+// Source: Copy kernel of STREAM (McCalpin) / BabelStream.
+// Details: docs/benchmarks.md#copy
+// Interface: docs/benchmark_contract.md
 
 #include <hip/hip_runtime.h>
 #include <cerrno>

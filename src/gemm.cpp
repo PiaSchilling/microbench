@@ -23,40 +23,12 @@
 // expect_counters=
 // ---- end metadata ----
 //
-// gemm.cpp -- matrix multiplication C = A * B (proxy kernel GEMM), blocked or naive
-// Interface: docs/benchmark_contract.md.
-//
-//   --precision   --accumulate   input   accumulation   output
-//   fp64          native         fp64    fp64           fp64
-//   fp32          native         fp32    fp32           fp32
-//   fp16          native         fp16    fp16           fp16
-//   fp16          fp32           fp16    fp32           fp16
-//   int8          native         int8    int32          int32
-//   int16         native         int16   int32          int32
-//   int32         native         int32   int32          int32
-//   int64         native         int64   int64          int64
-//
-//   blocked: M and N must be multiples of 128, K is arbitrary
-//
-// --kernel blocked (Standard): Jede Workgroup (256 Threads) berechnet eine TILE x TILE-Kachel von C. Sie laedt
-// dafuer ihren Zeilenstreifen von A (TILE x K) und Spaltenstreifen von B (K x TILE) in
-// Stuecken von je einer Cache-Line Tiefe ins LDS, jeder Thread akkumuliert RT x RT Elemente in
-// Registern. Jedes geladene Element wird so TILE-mal wiederverwendet. Keine Matrix Cores.
-//
-// Verkehrsmodell "kernel_level" (exakt das, was der Kernel aus dem globalen Speicher laedt/schreibt):
-//   Bytes = s_in * (M*K * N/TILE + K*N * M/TILE) + s_out * M*N
-//   Flop  = 2 * M*N*K
-//   AI    = 2K / (s_in * 2K/TILE + s_out)          (unabhaengig von M und N)
-//   fp64:  AI = 16 K / (K + 64)   -> K steuert die AI von ~0.25 (K=1) bis gegen 16
-// Jede geladene Cache-Line wird voll genutzt, sofern K <= 128/s_in oder K ein Vielfaches
-// davon ist (sonst liegen die Zeilen von A nicht auf Line-Grenzen). Das Modell entspricht damit dem Verkehr
-// zwischen Kernel und L1/L2. Der HBM-Verkehr kann niedriger sein, wenn sich Workgroups
-// Streifen von A/B ueber L2 oder Infinity Cache teilen.
-//
-// --kernel naive: Ein Thread pro Element von C, ohne Kacheln und LDS. Jeder Thread liest seine
-// ganze Zeile von A und Spalte von B, die Wiederverwendung haengt allein von den Caches ab.
-// Verkehrsmodell "minimal": A, B und C je genau einmal. Das ist eine Untergrenze fuer den
-// echten Verkehr (Obergrenze fuer die AI); der tatsaechliche liegt um Groessenordnungen hoeher.
+// gemm: matrix multiplication C = A * B on the VALU (no Matrix Cores), blocked
+// with LDS tiles or naive. K sets the arithmetic intensity: small K is
+// memory-bound, large K compute-bound (Level 2).
+// Source: from sratch by Claude (Opus 5.5).
+// Details: docs/benchmarks.md#gemm
+// Interface: docs/benchmark_contract.md
 
 #include <hip/hip_runtime.h>
 #include <algorithm>

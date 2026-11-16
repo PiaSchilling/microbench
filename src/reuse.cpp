@@ -17,29 +17,12 @@
 // expect_counters=
 // ---- end metadata ----
 //
-// Kernel Cache_bw: taken unchanged from the roofline benchmark of
-// rocprofiler-compute (ROCm Compute Profiler), github.com/ROCm/rocm-systems,
-// branch develop, commit 06cf5fb, projects/rocprofiler-compute/src/roofline/
-// benchmark/benchmark_base.py (kernel source there as a string, compiled with
-// hiprtc). Launch configuration as there: 256 threads per block, 128 blocks
-// per CU, float loads. Every block reads the WHOLE buffer `passes` times, so
-// the buffer (one cache size) is shared by all blocks of a CU/XCD.
-//
-// Changes for this suite (contract docs/benchmark_contract.md): compiled
-// ahead of time instead of hiprtc; time loop over --duration with ROI time
-// stamps and JSON output; argument check; the buffer is initialized (in
-// rocprof-compute it is summed uninitialized); no verification (all blocks
-// write the same result array, verify_ok = null). The last level cache is
-// called llc here, as in the rest of the suite (component config llc_bytes);
-// AMD calls it MALL (Memory Attached Last Level cache).
-//
-// Named "cache" until 2026-11-10 (renamed: too similar to "chase", and the
-// only benchmark named after its component; "reuse" names the access pattern,
-// the difference to copy, formerly stream). Kernel and behaviour unchanged.
-//
-// Replaces cache 0.1.0 (own kernel: every block read its own chunk, 4 blocks
-// per CU, double): it reached only ~14 TB/s for both L1 and L2, probably too
-// few blocks per CU (validation finding 14).
+// reuse: all blocks re-read one buffer of the size of the target cache level
+// and sum it up; after the first pass the data come from that level. Measures
+// read bandwidth of L1, L2 or LLC (Infinity Cache).
+// Source: Cache_bw kernel of the rocprof-compute roofline (MIT, see below).
+// Details: docs/benchmarks.md#reuse
+// Interface: docs/benchmark_contract.md
 //
 // ---------------------------------------------------------------------------
 // License of the kernel Cache_bw (rocprofiler-compute):

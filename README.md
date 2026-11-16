@@ -6,6 +6,8 @@ benchmarks, Bash and awk for everything else.
 
 Specification: [docs/benchmark_contract.md](docs/benchmark_contract.md)
 
+Benchmarks (background, sources, implementation notes): [docs/benchmarks.md](docs/benchmarks.md)
+
 ## Quick start
 
 ```bash

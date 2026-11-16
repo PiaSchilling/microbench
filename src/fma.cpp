@@ -20,24 +20,12 @@
 // expect_counters=
 // ---- end metadata ----
 //
-// Kernel: based on Guerreiro et al. (HPCA 2018, computeKernel.cu), ported to HIP.
-// Each thread loads one value, runs four independent chains of ops_per_element
-// multiply-adds and stores the sum. Interface: docs/benchmark_contract.md.
-//
-// Floating point (since 0.5.0): the original chain r = r*r + r overflows to inf
-// after 7 (fp16), 10 (fp32) or 13 (fp64) iterations; afterwards the same value
-// repeats, hardly any bits toggle and the power draw is far too low although the
-// VALU is fully busy (docs: validation findings 6 and 12). Now each chain
-// alternates between two FMAs that undo each other:
-//     r = r * a  + b        (a = 1.3, b = 0.7)
-//     r = r * ai + bi       (ai = 1/a, bi = -b/a)
-// The values stay bounded and change in every step (they jump between two
-// values per chain). a, b, ai, bi are kernel arguments, so the compiler cannot
-// fold the two FMAs at compile time.
-//
-// Integer types: unchanged, r = r*r + r. They are unsigned, so overflow is
-// defined (wrap-around) and the values keep changing.
-// bf16 is not included (no native VALU arithmetic on gfx942).
+// fma: every thread runs four independent chains of multiply-adds on values in
+// registers; no memory traffic inside the loop. Measures peak VALU throughput
+// per precision (compute corner of the design space).
+// Source: Guerreiro et al. (HPCA 2018), ported to HIP and adapted.
+// Details: docs/benchmarks.md#fma
+// Interface: docs/benchmark_contract.md
 
 #include <hip/hip_runtime.h>
 #include <cerrno>

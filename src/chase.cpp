@@ -18,11 +18,12 @@
 // expect_counters=
 // ---- end metadata ----
 //
-// One thread follows a random chain: j = next[j]. Every access depends on the
-// previous one, so nothing can run in parallel or be prefetched.
-// The chain is a random permutation with exactly one cycle through all nodes
-// (Sattolo's algorithm, fixed seed).
-// Interface: docs/benchmark_contract.md.
+// chase: one thread follows a random chain through a buffer (j = next[j]); every
+// load depends on the previous one, so nothing overlaps. Measures load latency
+// of L1, L2, LLC or HBM, selected by the buffer size.
+// Source: pointer chasing as in Mei & Chu (2017).
+// Details: docs/benchmarks.md#chase
+// Interface: docs/benchmark_contract.md
 
 #include <hip/hip_runtime.h>
 #include <cerrno>
