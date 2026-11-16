@@ -37,13 +37,3 @@ tests/run_tests.sh        # tests of wrapper and build script with mock benchmar
 tests/run_tests.sh -v     # also show the wrapper output of failed tests
 ```
 
-## Status
-
-| Part | State |
-|---|---|
-| Wrapper: configs, metadata, validation, plan, execution, contract check, results, repetitions, aggregation, timeout, signals, help | implemented |
-| Build script | implemented |
-| Telemetry: sampler (`tools/sampler.c`) and its use in the wrapper (ROI cut, energy, `m_*` fields, idle baseline) | implemented, tested on the GPU (check mode, probe) |
-| Hardware counters: pass planner, rocprofv3 passes, ROI cut, `counters.csv` (ROI view) | implemented, tested with a mock rocprofv3; not yet tested on the GPU |
-| Job view (whole benchmark process as phases) | open |
-| Slurm integration | open |

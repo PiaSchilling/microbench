@@ -1,10 +1,10 @@
 // ---- benchmark metadata ----
 // benchmark=gemm
-// level=3
+// level=2
 // component=GPU/Compute/VALU
-// description=Matrix multiplication C = A * B as proxy kernel (blocked with LDS tiles, or naive); no matrix cores
-// tags=proxy;gemm;lds
-// version=0.3.0
+// description=Matrix multiplication C = A * B on the VALU (blocked with LDS tiles, or naive); K shifts the load between memory and compute
+// tags=gemm;lds
+// version=0.3.1
 // precisions=fp64,fp32,fp16,int8,int16,int32,int64
 // extra_build_flags=
 //
