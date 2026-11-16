@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # build.sh - build the benchmarks (contract section 2)
 #
-# Usage: build.sh [--component <file>] [--src-dir <dir>] [--bin-dir <dir>] [<name> ...]
+# Usage: build.sh [--system-config <file>] [--src-dir <dir>] [--bin-dir <dir>] [<name> ...]
 #
 # Builds src/<name>.cpp -> build/<name> for all benchmarks and tools/sampler.c ->
 # build/sampler, or only the names given ("sampler" for the sampler).
-# Benchmarks: compiler $HIPCC (default: hipcc), architecture from the component config;
+# Benchmarks: compiler $HIPCC (default: hipcc), architecture from the system config;
 # the metadata of each benchmark is validated before it is built.
 # Sampler: compiler $CC (default: cc), amdsmi from $ROCM_PATH (default: /opt/rocm).
 
@@ -15,7 +15,7 @@ SUITE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=lib/common.sh
 source "$SUITE_DIR/lib/common.sh"
 
-COMPONENT=$SUITE_DIR/config/component.cfg
+SYSTEM_CONFIG=$SUITE_DIR/config/system.cfg
 SRC_DIR=$SUITE_DIR/src
 BIN_DIR=$SUITE_DIR/build
 HIPCC=${HIPCC:-hipcc}
@@ -27,7 +27,7 @@ NAMES=()
 
 while (($#)); do
     case $1 in
-        --component) COMPONENT=${2:?--component requires a value}; shift 2 ;;
+        --system-config) SYSTEM_CONFIG=${2:?--system-config requires a value}; shift 2 ;;
         --src-dir)   SRC_DIR=${2:?--src-dir requires a value}; shift 2 ;;
         --bin-dir)   BIN_DIR=${2:?--bin-dir requires a value}; shift 2 ;;
         --help | -h)
@@ -72,7 +72,7 @@ failed=()
 built=0
 if ((${#NAMES[@]})); then
     command -v "$HIPCC" >/dev/null 2>&1 || die "compiler '$HIPCC' not found (set HIPCC or load the ROCm module)"
-    comp_load "$COMPONENT"
+    comp_load "$SYSTEM_CONFIG"
     report_errors "build aborted" || exit 1
     ARCH=${COMP[arch]}
 fi

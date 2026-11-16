@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # plan_counter_passes.sh - distribute the wished counters over profiling passes (contract section 13)
 #
-# Usage: tools/plan_counter_passes.sh [--component <file>] [--wishlist <file>] [--out <file>]
+# Usage: tools/plan_counter_passes.sh [--system-config <file>] [--wishlist <file>] [--out <file>]
 #                                     [--rocprof <cmd>] [--device <n>] [--test-command "<cmd>"]
 #                                     [--test-timeout <s>]
 #
@@ -20,7 +20,7 @@ SUITE_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 # shellcheck source=../lib/common.sh
 source "$SUITE_DIR/lib/common.sh"
 
-COMPONENT=$SUITE_DIR/config/component.cfg
+SYSTEM_CONFIG=$SUITE_DIR/config/system.cfg
 WISHLIST=""
 OUT=""
 ROCPROF=${ROCPROF:-rocprofv3}
@@ -30,7 +30,7 @@ TEST_TIMEOUT=60
 
 while (($#)); do
     case $1 in
-        --component)    COMPONENT=${2:?--component requires a value}; shift 2 ;;
+        --system-config)    SYSTEM_CONFIG=${2:?--system-config requires a value}; shift 2 ;;
         --wishlist)     WISHLIST=${2:?--wishlist requires a value}; shift 2 ;;
         --out)          OUT=${2:?--out requires a value}; shift 2 ;;
         --rocprof)      ROCPROF=${2:?--rocprof requires a value}; shift 2 ;;
@@ -42,7 +42,7 @@ while (($#)); do
     esac
 done
 
-comp_load "$COMPONENT"
+comp_load "$SYSTEM_CONFIG"
 report_errors "aborted" || exit 1
 ARCH=${COMP[arch]}
 WISHLIST=${WISHLIST:-$SUITE_DIR/config/counters_wishlist_$ARCH.cfg}

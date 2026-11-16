@@ -5,7 +5,7 @@
 # Provides:
 #   logging      info / notice / warn / err / die, mirrored to $LOG_FILE once set
 #   errors       add_error / report_errors (collect all validation errors, report once)
-#   key=value    kv_parse: parser for component config, counter config, metadata
+#   key=value    kv_parse: parser for system config, counter config, metadata
 #   metadata     meta_load: extracts and validates the metadata block of src/<name>.cpp
 
 # ---------------------------------------------------------------------------
@@ -112,17 +112,17 @@ kv_parse() {
 }
 
 # ---------------------------------------------------------------------------
-# Component config
+# System config
 # ---------------------------------------------------------------------------
 
 declare -gA COMP=()
 declare -ga COMP_ORDER=()
 
-# comp_load <file>: parse and validate the component config into COMP
+# comp_load <file>: parse and validate the system config into COMP
 comp_load() {
     local file=$1 k
     if [[ ! -r $file ]]; then
-        add_error "component config: cannot read '$file'"
+        add_error "system config: cannot read '$file'"
         return 1
     fi
     kv_parse COMP COMP_ORDER "$file" <"$file"

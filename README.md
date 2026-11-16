@@ -22,7 +22,7 @@ tools/plan_counter_passes.sh                 # once per system: counters per pro
 ./run_suite.sh --mode production --repeat 3  # measure
 ```
 
-Runs are defined in `config/runs.cfg`, the hardware in `config/component.cfg`.
+Runs are defined in `config/runs.cfg`, the hardware in `config/system.cfg`.
 Results go to `results/<date>-<time>_<mode>/`; for analysis use `results.csv`
 (one row per run), `aggregates.csv` (statistics per label, with `--repeat > 1`) and,
 in profile mode, `counters.csv` (one row per run, pass and counter; join by `label`, `rep`).

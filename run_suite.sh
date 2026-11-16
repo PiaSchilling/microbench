@@ -2,7 +2,7 @@
 # run_suite.sh - wrapper of the benchmark suite
 #
 # Specification: docs/benchmark_contract.md (sections 9-14)
-# Implemented:   modes, run/component config, metadata, validation, plan,
+# Implemented:   modes, run/system config, metadata, validation, plan,
 #                execution, contract check, results (JSONL/CSV/TSV), repetitions,
 #                aggregation, timeout, signal handling, help, telemetry (sampler),
 #                hardware counters (rocprofv3 passes, profile mode)
@@ -29,7 +29,7 @@ WRAPPER_FIELDS="label rep benchmark benchmark_version mode device status reason 
 
 MODE=""
 CONFIG=$SUITE_DIR/config/runs.cfg
-COMPONENT=$SUITE_DIR/config/component.cfg
+SYSTEM_CONFIG=$SUITE_DIR/config/system.cfg
 SRC_DIR=$SUITE_DIR/src
 BIN_DIR=$SUITE_DIR/build
 RESULTS_ROOT=$SUITE_DIR/results
@@ -94,7 +94,7 @@ Modes:
 
 Options:
   --config <file>       run config                (default: config/runs.cfg)
-  --component <file>    component config          (default: config/component.cfg)
+  --system-config <file> system config            (default: config/system.cfg)
   --duration <s>        value for {DURATION}      (default: check ${MODE_DURATION[check]}, profile ${MODE_DURATION[profile]}, production ${MODE_DURATION[production]})
                         in check mode it applies to all runs, also fixed values
   --pause <s>           pause between runs        (default: check ${MODE_PAUSE[check]}, profile ${MODE_PAUSE[profile]}, production ${MODE_PAUSE[production]})
@@ -221,7 +221,7 @@ parse_args() {
         case $1 in
             --mode)      optval "$@"; MODE=$2; shift 2 ;;
             --config)    optval "$@"; CONFIG=$2; shift 2 ;;
-            --component) optval "$@"; COMPONENT=$2; shift 2 ;;
+            --system-config) optval "$@"; SYSTEM_CONFIG=$2; shift 2 ;;
             --duration)  optval "$@"; OPT_DURATION=$2; shift 2 ;;
             --pause)     optval "$@"; OPT_PAUSE=$2; shift 2 ;;
             --repeat)    optval "$@"; REPEAT=$2; shift 2 ;;
@@ -419,7 +419,7 @@ validate_runs() {
             elif ! in_list "$prec" "$bprec"; then
                 RUN_SKIP_PREC[i]="precision $prec is not implemented by $bench (precisions=$bprec)"
             elif ! in_list "$prec" "${COMP[precisions]:-}"; then
-                RUN_SKIP_PREC[i]="precision $prec is not supported by the hardware (component config)"
+                RUN_SKIP_PREC[i]="precision $prec is not supported by the hardware (system config)"
             fi
         fi
         RUN_EFF[i]="${eff[*]}"
@@ -616,7 +616,7 @@ prepare() {
     local l
     for l in "${PLAN_TEXT[@]}"; do log "PLAN   $l"; done
     cp -- "$CONFIG" "$RESDIR/config/runs.cfg"
-    cp -- "$COMPONENT" "$RESDIR/config/component.cfg"
+    cp -- "$SYSTEM_CONFIG" "$RESDIR/config/system.cfg"
     if profiling; then
         cp -- "$COUNTERS_FILE" "$RESDIR/config/counters.cfg"
         echo "label,rep,benchmark,benchmark_version,device,pass,counter,value,agg,dispatches,iterations,kernel_time_s,roi_s" \
@@ -1060,12 +1060,12 @@ require_env
 parse_args "$@"
 
 # phase 2: load
-comp_load "$COMPONENT"
+comp_load "$SYSTEM_CONFIG"
 parse_runs "$CONFIG"
 select_runs
 ((${#SEL[@]})) || { report_errors "nothing was run"; exit 1; }
 if [[ -n ${COMP[gpus]:-} && ${COMP[gpus]} =~ ^[0-9]+$ ]] && ((DEVICE >= COMP[gpus])); then
-    add_error "--device $DEVICE: the component config defines only ${COMP[gpus]} GPU(s)"
+    add_error "--device $DEVICE: the system config defines only ${COMP[gpus]} GPU(s)"
 fi
 
 # phase 3: validate

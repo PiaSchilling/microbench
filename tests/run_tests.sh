@@ -47,12 +47,12 @@ fail_check() { FAILS+=("$*"); }
 cfg() { printf '%s\n' "$1" >"$CDIR/runs.cfg"; }
 
 # wrapper command with the mocks. Later options override earlier ones,
-# so a test can pass its own --config, --component etc.
+# so a test can pass its own --config, --system-config etc.
 # Telemetry defaults keep the tests fast: no idle baseline, sampler every 20 ms.
 # Counter defaults: mock rocprofv3, tests/mock/counters.cfg (2 passes), 0.05 s per pass.
 wrap_cmd() {
     WRAP_CMD=("$SUITE/run_suite.sh" --src-dir "$MOCK/src" --bin-dir "$MOCK/bin"
-              --component "$MOCK/component.cfg" --config "$CDIR/runs.cfg"
+              --system-config "$MOCK/system.cfg" --config "$CDIR/runs.cfg"
               --results "$CDIR/results" --idle 0 --sample-interval 20
               --rocprof "$MOCK/bin/rocprofv3" --counters "$MOCK/counters.cfg" --profile-duration 0.05 "$@")
 }
@@ -559,42 +559,42 @@ test_documented_defaults_checked_only_in_check_mode() {
 }
 
 # ===========================================================================
-# Component config and options
+# System config and options
 # ===========================================================================
 
-# component_case <component config text> <expected message>
-component_case() {
-    printf '%s\n' "$1" >"$CDIR/component.cfg"
+# system_config_case <system config text> <expected message>
+system_config_case() {
+    printf '%s\n' "$1" >"$CDIR/system.cfg"
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode check --component "$CDIR/component.cfg"
+    wrap --mode check --system-config "$CDIR/system.cfg"
     check_rejected "$2"
 }
 
-register component_invalid_arch
-test_component_invalid_arch() {
-    component_case $'arch=sm_90\ngpus=1\nprecisions=fp64' "arch 'sm_90' is not a gfx target"
+register system_config_invalid_arch
+test_system_config_invalid_arch() {
+    system_config_case $'arch=sm_90\ngpus=1\nprecisions=fp64' "arch 'sm_90' is not a gfx target"
 }
 
-register component_invalid_gpus
-test_component_invalid_gpus() {
-    component_case $'arch=gfx942\ngpus=0\nprecisions=fp64' "gpus must be a positive integer"
+register system_config_invalid_gpus
+test_system_config_invalid_gpus() {
+    system_config_case $'arch=gfx942\ngpus=0\nprecisions=fp64' "gpus must be a positive integer"
 }
 
-register component_missing_key
-test_component_missing_key() {
-    component_case $'arch=gfx942\ngpus=1' "required key 'precisions' missing or empty"
+register system_config_missing_key
+test_system_config_missing_key() {
+    system_config_case $'arch=gfx942\ngpus=1' "required key 'precisions' missing or empty"
 }
 
-register component_unknown_key
-test_component_unknown_key() {
-    component_case $'arch=gfx942\ngpus=1\nprecisions=fp64\nfoo=1' "unknown key 'foo'"
+register system_config_unknown_key
+test_system_config_unknown_key() {
+    system_config_case $'arch=gfx942\ngpus=1\nprecisions=fp64\nfoo=1' "unknown key 'foo'"
 }
 
 register device_beyond_gpu_count
 test_device_beyond_gpu_count() {
     cfg "a  mock_ok  --duration {DURATION}"
     wrap --mode check --device 2
-    check_rejected "--device 2: the component config defines only 2 GPU(s)"
+    check_rejected "--device 2: the system config defines only 2 GPU(s)"
 }
 
 register unknown_mode
@@ -676,7 +676,7 @@ test_configs_and_sources_copied() {
     wrap --mode check
     need_dir || return
     check_contains "$DIR/config/runs.cfg" "mock_ok"
-    check_contains "$DIR/config/component.cfg" "arch=gfx942"
+    check_contains "$DIR/config/system.cfg" "arch=gfx942"
     check_contains "$DIR/config/src/mock_ok.cpp" "benchmark=mock_ok"
 }
 
@@ -1126,7 +1126,7 @@ test_counters_shown_in_plan() {
 
 # plan <args...>: run the pass planner with the mock profiler and a mock test command; sets RC
 plan() {
-    "$SUITE/tools/plan_counter_passes.sh" --component "$MOCK/component.cfg" --rocprof "$MOCK/bin/rocprofv3" \
+    "$SUITE/tools/plan_counter_passes.sh" --system-config "$MOCK/system.cfg" --rocprof "$MOCK/bin/rocprofv3" \
         --test-command "$MOCK/bin/mock_ok --duration 0.01" --wishlist "$CDIR/wish.cfg" --out "$CDIR/counters.cfg" \
         "$@" >"$CDIR/out" 2>"$CDIR/err"
     RC=$?
@@ -1227,7 +1227,7 @@ EOF
     done
     FAKE_LOG_DIR=$CDIR HIPCC=${BUILD_HIPCC:-$CDIR/fakebin/hipcc} CC=$CDIR/fakebin/cc \
         ROCM_PATH=${BUILD_ROCM:-$CDIR/rocm} "$SUITE/build.sh" --src-dir "$MOCK/src" \
-        --bin-dir "$CDIR/build" --component "$MOCK/component.cfg" "$@" >"$CDIR/out" 2>"$CDIR/err"
+        --bin-dir "$CDIR/build" --system-config "$MOCK/system.cfg" "$@" >"$CDIR/out" 2>"$CDIR/err"
     RC=$?
 }
 

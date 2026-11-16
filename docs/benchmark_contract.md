@@ -1,5 +1,5 @@
 status: draft
-version: 0.9.0
+version: 0.10.0
 
 # Benchmark Contract and Wrapper Interfaces
 
@@ -8,7 +8,7 @@ This document specifies the interface between the wrapper and the benchmarks, th
 Guiding constraint: **no external dependencies** (R1). The wrapper is written in Bash and uses only standard tools (`awk`, `sed`, `grep`). Therefore:
 
 - JSON is used **only as machine output** (benchmark result line, `results.jsonl`). It is written with `printf` and read with `awk`, which is only possible because it is kept flat.
-- All **input files** (metadata, component config, run config) use line-based formats that Bash reads natively.
+- All **input files** (metadata, system config, run config) use line-based formats that Bash reads natively.
 - Human-readable output is **TSV**.
 
 ---
@@ -28,7 +28,7 @@ suite/
         sampler.c              telemetry sampler (Section 13)
         plan_counter_passes.sh generates the counter config (Section 13)
     config/
-        component.cfg          component config (Section 8)
+        system.cfg          system config (Section 8)
         counters_wishlist_<arch>.cfg  wished counters, input of the pass planner (Section 13)
         counters_<arch>.cfg    counter config: counters per pass (Section 13, generated)
         runs.cfg               run config (Section 9)
@@ -51,10 +51,10 @@ suite/
   hipcc -O3 -std=c++17 -ffp-contract=fast --offload-arch=<arch> <extra_build_flags> src/<name>.cpp -o build/<name>
   ```
 
-- Usage: `build.sh [--component <file>] [<name> ...]` builds all benchmarks or the given ones. The compiler can be replaced with the environment variable `HIPCC`. The metadata of each benchmark is validated before it is built; benchmarks with invalid metadata are not built.
+- Usage: `build.sh [--system-config <file>] [<name> ...]` builds all benchmarks or the given ones. The compiler can be replaced with the environment variable `HIPCC`. The metadata of each benchmark is validated before it is built; benchmarks with invalid metadata are not built.
 
 - `-std=c++17` and `-ffp-contract=fast` are kept explicit on purpose, even if current compilers default to them, so the build does not depend on compiler defaults (Q2).
-- `<arch>` comes from the component config (Section 8), `<extra_build_flags>` from the benchmark metadata (normally empty).
+- `<arch>` comes from the system config (Section 8), `<extra_build_flags>` from the benchmark metadata (normally empty).
 - The same build script builds the telemetry sampler from `tools/sampler.c` against the amdsmi library shipped with ROCm (`-lamd_smi`). This is not an external dependency, since ROCm is required anyway.
 
 ---
@@ -93,7 +93,7 @@ Block rules:
 
 - The block is the first thing in the file (no lines before the start marker).
 - Start and end markers are exactly `// ---- benchmark metadata ----` and `// ---- end metadata ----`.
-- Every line inside starts with `//`. After removing the leading `// ` (or a bare `//`), the content is line-based `key=value`, with `#` for comment lines and empty lines ignored, the same syntax as the component config.
+- Every line inside starts with `//`. After removing the leading `// ` (or a bare `//`), the content is line-based `key=value`, with `#` for comment lines and empty lines ignored, the same syntax as the system config.
 - The wrapper extracts the block with `sed` and parses it line by line; it is **not** executed as shell code.
 - Build and usage instructions no longer belong in the file header; they follow from this contract and from `--help <benchmark>`.
 
@@ -115,7 +115,7 @@ Rules:
 
 - Flat values only, one key per line, values contain no line breaks and no `|` (except as separator in `param.*`).
 - `param.*` entries are **descriptive** (help output, Q4). Argument validation lives in the benchmark code (`--check`, Section 4). To keep both consistent, `check` mode verifies that every documented parameter with its default is accepted by `--check`.
-- Runs whose `--precision` is not in the intersection of the benchmark's `precisions` and the component config's `precisions` are skipped with a notice.
+- Runs whose `--precision` is not in the intersection of the benchmark's `precisions` and the system config's `precisions` are skipped with a notice.
 
 ---
 
@@ -208,7 +208,7 @@ The wrapper checks the output of **every** run, in all modes. A violation makes 
 
 ---
 
-## 8. Component config
+## 8. System config
 
 Line-based `key=value`, `#` for comment lines. Parsed line by line, not executed.
 
@@ -283,7 +283,7 @@ On the terminal the columns are aligned; `summary.tsv` contains the same rows ta
 |---|---|
 | `ok` | exit code 0 |
 | `error` | exit code 1, or output violates the contract |
-| `skipped` | exit code 2, or filtered out by the precision filter (precision not implemented by the benchmark or not supported by the component config) |
+| `skipped` | exit code 2, or filtered out by the precision filter (precision not implemented by the benchmark or not supported by the system config) |
 | `invalid` | exit code 3 |
 | `timeout` | killed by the wrapper (Section 12) |
 
@@ -299,7 +299,7 @@ results/<YYYYmmdd-HHMMSS>_<mode>/
     summary.tsv            human overview, one row per run (as on the terminal)
     aggregates.tsv         human overview, one row per label (only with --repeat > 1)
     wrapper.log            wrapper log: start/end, plan, notices, errors
-    config/                copies of run config, component config, counter config and the source of every benchmark used
+    config/                copies of run config, system config, counter config and the source of every benchmark used
     telemetry.csv          raw sampler output for all GPUs over the whole invocation (Section 13)
     sampler.log            stderr of the sampler
     idle/idle.csv          idle baseline, one row per GPU (Section 12, phase 6)
@@ -386,7 +386,7 @@ Selected with `--mode check|profile|production`.
 |---|---|
 | `--mode check\|profile\|production` | Mode (Section 11), required for a run |
 | `--config <file>` | Run config |
-| `--component <file>` | Component config |
+| `--system-config <file>` | System config |
 | `--duration <s>` | Overrides the mode's default for `{DURATION}` |
 | `--pause <s>` | Overrides the mode's default pause between runs |
 | `--repeat <n>` | Number of repetitions (rounds), default 1 |
@@ -407,8 +407,8 @@ Selected with `--mode check|profile|production`.
 ### Phases
 
 1. **Arguments:** parse and check the wrapper options.
-2. **Load:** component config, run config, metadata of every referenced benchmark.
-3. **Validate (no GPU):** component config, run config syntax, unique labels, metadata, benchmark source and binary exist, sampler binary exists (not in `check` mode), in `profile` mode the counter config (passes numbered 1…K without gaps, valid counter names, no counter twice, `agg` is `sum` or `wmean`) and the profiler, `--duration` present, precision filter (filtered runs become `skipped`, not an error), `--check` for every run. In `check` mode additionally: every documented parameter default (`param.*`) is accepted by `--check`. **All** errors are collected and reported together; if there is any, the wrapper exits without starting a run.
+2. **Load:** system config, run config, metadata of every referenced benchmark.
+3. **Validate (no GPU):** system config, run config syntax, unique labels, metadata, benchmark source and binary exist, sampler binary exists (not in `check` mode), in `profile` mode the counter config (passes numbered 1…K without gaps, valid counter names, no counter twice, `agg` is `sum` or `wmean`) and the profiler, `--duration` present, precision filter (filtered runs become `skipped`, not an error), `--check` for every run. In `check` mode additionally: every documented parameter default (`param.*`) is accepted by `--check`. **All** errors are collected and reported together; if there is any, the wrapper exits without starting a run.
 4. **Plan:** substitute `{DURATION}`, assign devices, form the run list (rounds × runs). Print the plan and the estimated total duration (runs + pauses + idle baseline + counter passes), to help choosing the Slurm time limit.
 5. **Prepare:** create the result directory, copy configs and sources, start the sampler (not in `check` mode) and wait for its first sample (Section 13).
 6. **Idle baseline:** `--idle` seconds without load (not in `check` mode), summarized per GPU in `idle/idle.csv` and printed, as reference (e.g. idle power per GPU). The wrapper has no monotonic clock, so this window is cut by `unix_ns`.
@@ -595,8 +595,8 @@ Help texts are generated from the metadata, so there is one source and benchmark
 - **Counters as time series (stage 2):** collect hardware counters device-wide in the sampler (agent profiling of rocprofiler-sdk), on the same timeline as telemetry and possibly with less overhead than dispatch mode. Feasibility from a separate process and required permissions are to be tested first. The rest of the wrapper is unaffected, since all sources are cut by the monotonic clock.
 
 - **Multiple GPUs:** the wrapper works with independent run units (benchmark, arguments, device, mode), each with its own output directory and per-device monitoring. Later, each run line is executed on all GPUs simultaneously with a synchronized start; `runs/<label>/` then gets one subdirectory per device.
-- **Auto-generated component config:** read `arch`, `gpus`, precisions and cache sizes from the system (e.g. `rocminfo`, `amd-smi`).
-- **Derived parameters:** working set sizes for memory benchmarks derived from the cache sizes in the component config.
+- **Auto-generated system config:** read `arch`, `gpus`, precisions and cache sizes from the system (e.g. `rocminfo`, `amd-smi`).
+- **Derived parameters:** working set sizes for memory benchmarks derived from the cache sizes in the system config.
 - **Counter expectations:** format of `expect_counters`, once the counter selection is defined.
 - **Job view of counters and telemetry:** in addition to the ROI view, the whole benchmark process (setup, warmup, ROI, verification) as phases, from the same raw data (`rocprof/`, `telemetry.csv`); see `views_and_phases.md`.
 - **CPU benchmarks** (R7): same contract, device selection via thread count and pinning instead of `HIP_VISIBLE_DEVICES`.
