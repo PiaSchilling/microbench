@@ -11,7 +11,7 @@
 // param.duration=required|> 0 (seconds)|Length of the timed loop
 // param.elements=134217728|> 0, multiple of 256|Elements per array (8 B each); working set = 16 B x elements
 //
-// # Expectations (validation mode). To be confirmed with a disassembly (--save-temps).
+// # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=global_load_dwordx2;global_store_dwordx2
 // expect_counters=
 // ---- end metadata ----

@@ -13,7 +13,7 @@
 // param.ops_per_element=1000000|>= 1|Multiply-adds per chain and thread; controls arithmetic intensity
 // param.precision=fp64|see precisions|Data type of the computation (integers are unsigned)
 //
-// # Expectations (validation mode). To be confirmed with a disassembly (--save-temps)
+// # Expectations (profile mode). To be confirmed with a disassembly (--save-temps)
 // # before they are enabled: the compiler may emit v_fmac_* instead of v_fma_*.
 // # expect_isa.fp64=v_fma_f64
 // # expect_isa.fp32=v_fma_f32

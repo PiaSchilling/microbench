@@ -966,7 +966,7 @@ test_sampler_stopped_on_sigterm() {
 }
 
 # ===========================================================================
-# Hardware counters (validation mode, rocprofv3 mock)
+# Hardware counters (profile mode, rocprofv3 mock)
 # ===========================================================================
 
 # counter_value <label> <pass> <counter> <column>: one cell of counters.csv
@@ -987,7 +987,7 @@ check_counter() {
 register counters_written_in_long_format
 test_counters_written_in_long_format() {
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --duration 0.2
+    wrap --mode profile --duration 0.2
     check_rc 0
     check_status a 1 ok
     need_dir || return
@@ -1002,7 +1002,7 @@ register counters_exclude_dispatches_outside_roi
 test_counters_exclude_dispatches_outside_roi() {
     # the mock writes one warmup dispatch before the ROI and one per iteration inside it
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --duration 0.2
+    wrap --mode profile --duration 0.2
     need_dir || return
     local it
     it=$(counter_value a 1 SQ_WAVES iterations)
@@ -1014,7 +1014,7 @@ test_counters_exclude_dispatches_outside_roi() {
 register counters_wmean_aggregation
 test_counters_wmean_aggregation() {
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --duration 0.2
+    wrap --mode profile --duration 0.2
     check_counter a 2 MeanOccupancyPerCU value 12.5
     check_counter a 2 MeanOccupancyPerCU agg '"wmean"'
     check_counter a 1 SQ_WAVES agg '"sum"'
@@ -1023,7 +1023,7 @@ test_counters_wmean_aggregation() {
 register counters_use_profile_duration
 test_counters_use_profile_duration() {
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --duration 0.2 --profile-duration 0.07
+    wrap --mode profile --duration 0.2 --profile-duration 0.07
     need_dir || return
     check_contains "$DIR/runs/a/rep1/pass1/command.txt" "--duration 0.07"
     check_contains "$DIR/runs/a/rep1/pass0/command.txt" "--duration 0.2"
@@ -1032,7 +1032,7 @@ test_counters_use_profile_duration() {
 register counters_prof_slowdown_fields
 test_counters_prof_slowdown_fields() {
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --duration 0.2
+    wrap --mode profile --duration 0.2
     check_num a 1 m_prof_slowdown_p1 1 0.2
     check_num a 1 m_prof_slowdown_p2 1 0.2
 }
@@ -1040,7 +1040,7 @@ test_counters_prof_slowdown_fields() {
 register counters_tolerate_profiler_stdout
 test_counters_tolerate_profiler_stdout() {
     cfg "a  mock_ok  --duration {DURATION}"
-    MOCK_ROCPROF=noisy wrap --mode validation --duration 0.2
+    MOCK_ROCPROF=noisy wrap --mode profile --duration 0.2
     check_status a 1 ok
     need_dir && check_csv "$DIR/counters.csv" 4
 }
@@ -1048,7 +1048,7 @@ test_counters_tolerate_profiler_stdout() {
 register counters_profiler_failure_is_error
 test_counters_profiler_failure_is_error() {
     cfg "a  mock_ok  --duration {DURATION}"
-    MOCK_ROCPROF=fail wrap --mode validation --duration 0.2
+    MOCK_ROCPROF=fail wrap --mode profile --duration 0.2
     check_rc 4
     check_status a 1 error
     check_record a 1 '"reason":"counters: pass 1: exit code 1'
@@ -1058,7 +1058,7 @@ test_counters_profiler_failure_is_error() {
 register counters_other_clock_is_error
 test_counters_other_clock_is_error() {
     cfg "a  mock_ok  --duration {DURATION}"
-    MOCK_ROCPROF=clockshift wrap --mode validation --duration 0.2
+    MOCK_ROCPROF=clockshift wrap --mode profile --duration 0.2
     check_status a 1 error
     check_record a 1 "no kernel dispatch inside the ROI"
 }
@@ -1066,7 +1066,7 @@ test_counters_other_clock_is_error() {
 register counters_rejected_counter_is_error
 test_counters_rejected_counter_is_error() {
     cfg "a  mock_ok  --duration {DURATION}"
-    MOCK_ROCPROF_REJECT=TCC_HIT_sum wrap --mode validation --duration 0.2
+    MOCK_ROCPROF_REJECT=TCC_HIT_sum wrap --mode profile --duration 0.2
     check_status a 1 error
     check_record a 1 "counters: pass 2:"
     need_dir && check_csv "$DIR/counters.csv" 0     # nothing of a half-profiled run
@@ -1075,7 +1075,7 @@ test_counters_rejected_counter_is_error() {
 register counters_missing_config_rejected
 test_counters_missing_config_rejected() {
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --counters "$CDIR/none.cfg"
+    wrap --mode profile --counters "$CDIR/none.cfg"
     check_rejected "plan_counter_passes.sh"
 }
 
@@ -1083,7 +1083,7 @@ register counters_invalid_config_rejected
 test_counters_invalid_config_rejected() {
     cfg "a  mock_ok  --duration {DURATION}"
     printf 'pass.1=SQ_WAVES\npass.3=SQ_BUSY_CYCLES\nagg.SQ_WAVES=max\n' >"$CDIR/c.cfg"
-    wrap --mode validation --counters "$CDIR/c.cfg"
+    wrap --mode profile --counters "$CDIR/c.cfg"
     check_rejected "pass.2 is missing"
     check_contains "$CDIR/err" "agg.SQ_WAVES must be sum or wmean"
 }
@@ -1091,7 +1091,7 @@ test_counters_invalid_config_rejected() {
 register counters_missing_profiler_rejected
 test_counters_missing_profiler_rejected() {
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --rocprof "$CDIR/no_rocprofv3"
+    wrap --mode profile --rocprof "$CDIR/no_rocprofv3"
     check_rejected "profiler '$CDIR/no_rocprofv3' not found"
 }
 
@@ -1108,7 +1108,7 @@ test_counters_not_in_production() {
 register counters_no_passes_after_failed_pass0
 test_counters_no_passes_after_failed_pass0() {
     cfg "a  mock_contract  --duration {DURATION}"      # exit 0, but output violates the contract
-    wrap --mode validation --duration 0.2
+    wrap --mode profile --duration 0.2
     check_status a 1 error
     check_record a 1 '"reason":"contract:'
     need_dir || return
@@ -1118,7 +1118,7 @@ test_counters_no_passes_after_failed_pass0() {
 register counters_shown_in_plan
 test_counters_shown_in_plan() {
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --dry-run
+    wrap --mode profile --dry-run
     check_contains "$CDIR/err" "Counters: 2 pass(es) per run with 4 counters"
 }
 
@@ -1159,7 +1159,7 @@ test_planner_output_accepted_by_wrapper() {
     MOCK_ROCPROF_MAX=2 plan
     check_rc 0
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --duration 0.2 --counters "$CDIR/counters.cfg"
+    wrap --mode profile --duration 0.2 --counters "$CDIR/counters.cfg"
     check_rc 0
     need_dir && check_csv "$DIR/counters.csv" 3
 }
@@ -1180,7 +1180,7 @@ test_planner_missing_test_binary() {
 register dry_run_runs_nothing
 test_dry_run_runs_nothing() {
     cfg "a  mock_ok  --duration {DURATION}"
-    wrap --mode validation --dry-run
+    wrap --mode profile --dry-run
     check_rc 0
     check_contains "$CDIR/err" "Estimated time"
     check_no_results

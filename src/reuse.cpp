@@ -12,7 +12,7 @@
 // param.level=l1|l1, l2, llc|Cache level: buffer of 32 KiB (L1), 4 MiB (L2) or 64 MiB (LLC = Infinity Cache), sizes for gfx942
 // param.passes=auto|auto or >= 1|How often every block reads the whole buffer per launch; auto = 100 (l1), 10 (l2), 1 (llc) as in rocprof-compute
 //
-// # Expectations (validation mode). To be confirmed with a disassembly (--save-temps).
+// # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=global_load_dword
 // expect_counters=
 // ---- end metadata ----

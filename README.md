@@ -15,7 +15,7 @@ Specification: [docs/benchmark_contract.md](docs/benchmark_contract.md)
 ./run_suite.sh --help fma                    # parameters of one benchmark
 ./run_suite.sh --mode check                  # do all runs work and follow the contract?
 tools/plan_counter_passes.sh                 # once per system: counters per profiling pass
-./run_suite.sh --mode validation             # telemetry + hardware counters (counters.csv)
+./run_suite.sh --mode profile             # telemetry + hardware counters (counters.csv)
 ./run_suite.sh --mode production --dry-run   # show the plan and the estimated time
 ./run_suite.sh --mode production --repeat 3  # measure
 ```
@@ -23,7 +23,7 @@ tools/plan_counter_passes.sh                 # once per system: counters per pro
 Runs are defined in `config/runs.cfg`, the hardware in `config/component.cfg`.
 Results go to `results/<date>-<time>_<mode>/`; for analysis use `results.csv`
 (one row per run), `aggregates.csv` (statistics per label, with `--repeat > 1`) and,
-in validation mode, `counters.csv` (one row per run, pass and counter; join by `label`, `rep`).
+in profile mode, `counters.csv` (one row per run, pass and counter; join by `label`, `rep`).
 The counters to collect are listed in `config/counters_wishlist_gfx942.cfg`;
 `tools/plan_counter_passes.sh` distributes them over passes on a GPU node and writes
 `config/counters_gfx942.cfg`.

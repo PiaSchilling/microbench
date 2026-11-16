@@ -18,7 +18,7 @@
 // param.n=4096|>= 1; blocked: multiple of 128|Columns of B and C
 // param.k=4096|>= 1|Columns of A, rows of B; controls the arithmetic intensity of the blocked kernel
 //
-// # Expectations (validation mode). To be confirmed with a disassembly (--save-temps).
+// # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa.fp64=v_fma_f64
 // expect_counters=
 // ---- end metadata ----

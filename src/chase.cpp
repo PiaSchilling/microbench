@@ -13,7 +13,7 @@
 // param.stride_bytes=128|> 0, multiple of 4|Distance between nodes; at least one cache line (128 B on MI300A)
 // param.accesses=1000000|>= 1|Accesses per kernel launch; should be >= nodes to visit the whole chain
 //
-// # Expectations (validation mode). To be confirmed with a disassembly (--save-temps).
+// # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=global_load_dword
 // expect_counters=
 // ---- end metadata ----

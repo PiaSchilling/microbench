@@ -1,5 +1,5 @@
 status: draft
-version: 0.8.0
+version: 0.9.0
 
 # Benchmark Contract and Wrapper Interfaces
 
@@ -79,7 +79,7 @@ The metadata is a comment block at the very beginning of the source file:
 // param.ops_per_element=1000000|>= 1|Multiply-adds per element; controls arithmetic intensity
 // param.precision=fp64|see precisions|Data type of the computation
 //
-// # Expectations (checked in validation mode)
+// # Expectations (checked in profile mode)
 // expect_isa.fp64=v_fma_f64
 // expect_isa.fp32=v_fma_f32
 // expect_counters=
@@ -303,7 +303,7 @@ results/<YYYYmmdd-HHMMSS>_<mode>/
     telemetry.csv          raw sampler output for all GPUs over the whole invocation (Section 13)
     sampler.log            stderr of the sampler
     idle/idle.csv          idle baseline, one row per GPU (Section 12, phase 6)
-    counters.csv           hardware counters cut to the ROI, one row per run, pass and counter (validation mode, Section 13)
+    counters.csv           hardware counters cut to the ROI, one row per run, pass and counter (profile mode, Section 13)
     runs/<label>/rep<i>/pass<k>/
         command.txt        exact invocation incl. environment (e.g. HIP_VISIBLE_DEVICES=0 ./fma --duration 30 ...)
         stdout.json        raw benchmark output (in passes k >= 1: the JSON line extracted from stdout_raw.log)
@@ -313,7 +313,7 @@ results/<YYYYmmdd-HHMMSS>_<mode>/
         rocprof/           raw rocprofv3 output, one row per kernel start and counter (passes k >= 1)
 ```
 
-Run directories are created only for executed runs (not for runs filtered by the precision filter). In `check` and `production` mode there is only `pass0`. In `validation` mode, `pass0` is the run without profiler and `pass1` … `pass<k>` are the counter passes (Section 13).
+Run directories are created only for executed runs (not for runs filtered by the precision filter). In `check` and `production` mode there is only `pass0`. In `profile` mode, `pass0` is the run without profiler and `pass1` … `pass<k>` are the counter passes (Section 13).
 
 ### `results.jsonl`
 
@@ -355,15 +355,15 @@ Computed at the end, when all repetitions of a label are available. Only repetit
 
 - `std` is the sample standard deviation (n−1). `cv = std / mean`.
 - `n_ok` is the number of included repetitions; with `n_ok < 2`, `std` and `cv` are empty.
-- No threshold on `cv` for now; it is reported so a realistic threshold can be derived from validation runs later.
+- No threshold on `cv` for now; it is reported so a realistic threshold can be derived from profile runs later.
 
 ---
 
 ## 11. Wrapper modes
 
-Selected with `--mode check|validation|production`.
+Selected with `--mode check|profile|production`.
 
-| | `check` | `validation` | `production` |
+| | `check` | `profile` | `production` |
 |---|---|---|---|
 | Purpose | does every run work and comply with this contract? | does every benchmark stress what it claims to? | training runs for Powersched |
 | `{DURATION}` (default) | 0.001 s (all runs) | 10 s | 120 s |
@@ -373,8 +373,8 @@ Selected with `--mode check|validation|production`.
 
 - Mode durations and pauses have defaults and can be overridden with the wrapper's `--duration` and `--pause`.
 - Before every mode, the wrapper calls each run once with `--check` and aborts before any GPU work if an argument is invalid.
-- In `validation` mode every run is executed `1 + k` times: pass 0 without profiler, then one pass per counter set (Section 13).
-- Typical workflow: `check` after every change, `validation` once per new benchmark or system, `production` for training.
+- In `profile` mode every run is executed `1 + k` times: pass 0 without profiler, then one pass per counter set (Section 13).
+- Typical workflow: `check` after every change, `profile` once per new benchmark or system, `production` for training.
 
 ---
 
@@ -384,7 +384,7 @@ Selected with `--mode check|validation|production`.
 
 | Option | Meaning |
 |---|---|
-| `--mode check\|validation\|production` | Mode (Section 11), required for a run |
+| `--mode check\|profile\|production` | Mode (Section 11), required for a run |
 | `--config <file>` | Run config |
 | `--component <file>` | Component config |
 | `--duration <s>` | Overrides the mode's default for `{DURATION}` |
@@ -396,7 +396,7 @@ Selected with `--mode check|validation|production`.
 | `--timeout <s>` | Per-run timeout (default `duration × 2 + 60 s`) |
 | `--sample-interval <ms>` | Telemetry sampling interval (default 100; 1 to 60000) |
 | `--idle <s>` | Duration of the idle baseline (default 5; 0 disables it) |
-| `--counters <file>` | Counter config (default `config/counters_<arch>.cfg`; `validation` only) |
+| `--counters <file>` | Counter config (default `config/counters_<arch>.cfg`; `profile` only) |
 | `--rocprof <cmd>` | Profiler command (default `rocprofv3`) |
 | `--profile-duration <s>` | `--duration` of the benchmark in the counter passes (default 2; replaces the run's `--duration` there) |
 | `--results <dir>` | Where result directories are created (default `results/`) |
@@ -408,11 +408,11 @@ Selected with `--mode check|validation|production`.
 
 1. **Arguments:** parse and check the wrapper options.
 2. **Load:** component config, run config, metadata of every referenced benchmark.
-3. **Validate (no GPU):** component config, run config syntax, unique labels, metadata, benchmark source and binary exist, sampler binary exists (not in `check` mode), in `validation` mode the counter config (passes numbered 1…K without gaps, valid counter names, no counter twice, `agg` is `sum` or `wmean`) and the profiler, `--duration` present, precision filter (filtered runs become `skipped`, not an error), `--check` for every run. In `check` mode additionally: every documented parameter default (`param.*`) is accepted by `--check`. **All** errors are collected and reported together; if there is any, the wrapper exits without starting a run.
+3. **Validate (no GPU):** component config, run config syntax, unique labels, metadata, benchmark source and binary exist, sampler binary exists (not in `check` mode), in `profile` mode the counter config (passes numbered 1…K without gaps, valid counter names, no counter twice, `agg` is `sum` or `wmean`) and the profiler, `--duration` present, precision filter (filtered runs become `skipped`, not an error), `--check` for every run. In `check` mode additionally: every documented parameter default (`param.*`) is accepted by `--check`. **All** errors are collected and reported together; if there is any, the wrapper exits without starting a run.
 4. **Plan:** substitute `{DURATION}`, assign devices, form the run list (rounds × runs). Print the plan and the estimated total duration (runs + pauses + idle baseline + counter passes), to help choosing the Slurm time limit.
 5. **Prepare:** create the result directory, copy configs and sources, start the sampler (not in `check` mode) and wait for its first sample (Section 13).
 6. **Idle baseline:** `--idle` seconds without load (not in `check` mode), summarized per GPU in `idle/idle.csv` and printed, as reference (e.g. idle power per GPU). The wrapper has no monotonic clock, so this window is cut by `unix_ns`.
-7. **Execute:** for each run: pass 0 (benchmark without profiler → evaluate exit code, JSON, required fields → cut telemetry to the ROI) → in `validation` mode, if pass 0 is `ok` or `invalid`: passes 1…K under rocprofv3 (each checked like pass 0, counters cut to the ROI of that pass) → append the counter rows of all passes to `counters.csv` → append the record to `results.jsonl`, rewrite `results.csv`, print TSV row → pause. There is no pause between the passes of one run.
+7. **Execute:** for each run: pass 0 (benchmark without profiler → evaluate exit code, JSON, required fields → cut telemetry to the ROI) → in `profile` mode, if pass 0 is `ok` or `invalid`: passes 1…K under rocprofv3 (each checked like pass 0, counters cut to the ROI of that pass) → append the counter rows of all passes to `counters.csv` → append the record to `results.jsonl`, rewrite `results.csv`, print TSV row → pause. There is no pause between the passes of one run.
 8. **Finish:** stop the sampler, aggregation (with `--repeat > 1`), final tables, wrapper exit code.
 
 ### Repetitions and order
@@ -446,8 +446,8 @@ Selected with `--mode check|validation|production`.
 
 | Level | Tool | Modes | What |
 |---|---|---|---|
-| Telemetry | own sampler (`tools/sampler.c`, amdsmi C library) | `validation` (pass 0), `production` | power, energy, clocks, temperatures, utilization, VRAM, throttling, per GPU over time |
-| Hardware counters | `rocprofv3`, per kernel start | `validation` (passes 1…k) | instruction mix, pipeline utilization, cache and memory traffic per kernel start |
+| Telemetry | own sampler (`tools/sampler.c`, amdsmi C library) | `profile` (pass 0), `production` | power, energy, clocks, temperatures, utilization, VRAM, throttling, per GPU over time |
+| Hardware counters | `rocprofv3`, per kernel start | `profile` (passes 1…k) | instruction mix, pipeline utilization, cache and memory traffic per kernel start |
 
 The amd-smi command-line tool is not used: its timestamps are Unix time with one-second resolution, which is too coarse to cut data to the ROI.
 
@@ -489,7 +489,7 @@ sampler --probe <seconds> [--interval-ms <n>]    measure how often the values ar
 ### Hardware counters
 
 - Collected with `rocprofv3` in dispatch mode (per kernel start). This requires the profiler inside the benchmark process; reimplementing this is out of scope.
-- **Passes in `validation` mode:**
+- **Passes in `profile` mode:**
   - **Pass 0:** benchmark without profiler, telemetry only. Telemetry in the results comes from this pass only, because the profiler serializes kernel starts and inserts gaps, which changes power and clocks.
   - **Passes 1…k:** benchmark under `rocprofv3`, one counter set per pass, with `--duration` replaced by `--profile-duration` (default 2 s): counter values are sums over kernel starts and do not need a long run, and the profiler output grows with every kernel start. The sampler keeps running, but its data from these passes is not used for results.
   - Invocation per pass: `HIP_VISIBLE_DEVICES=<n> rocprofv3 --pmc <counters> --output-format csv -d runs/.../pass<k>/rocprof -- <benchmark> <args>`. The profiler may print log lines on stdout; the JSON line is the last line starting with `{`.
@@ -532,7 +532,7 @@ agg.OccupancyPercent=wmean
 
 ### `counters.csv`
 
-Long format: one row per run, repetition, pass and counter, written in validation mode. It is a separate file because the counter set depends on the system, and so the results table keeps the same columns with and without counters. The analysis joins it with `results.csv` by `label` and `rep`.
+Long format: one row per run, repetition, pass and counter, written in profile mode. It is a separate file because the counter set depends on the system, and so the results table keeps the same columns with and without counters. The analysis joins it with `results.csv` by `label` and `rep`.
 
 | Column | Meaning |
 |---|---|
@@ -564,7 +564,7 @@ These rows are the **ROI view**: only kernel starts inside the ROI. A **job view
 | `m_max_temp_c`, `m_max_temp_mem_c` | sampler | maximum hotspot and HBM temperature over the ROI |
 | `m_avg_gfx_util_pct`, `m_avg_mem_util_pct` | sampler | mean utilization over the ROI |
 | `m_max_read_ms` | sampler | longest read of the metrics table inside the ROI |
-| `m_prof_slowdown_p<k>` | wrapper | time per iteration in pass `k` divided by that of pass 0 (`runtime_s / iterations`); 1.0 means no profiler overhead (validation mode) |
+| `m_prof_slowdown_p<k>` | wrapper | time per iteration in pass `k` divided by that of pass 0 (`runtime_s / iterations`); 1.0 means no profiler overhead (profile mode) |
 
 Hardware counters are not `m_*` fields but rows of `counters.csv` (see above). Raw data (`telemetry.csv`, `rocprof/`) is always kept; ratios are computed in the analysis, not in the wrapper.
 

@@ -3,7 +3,7 @@ version: 0.1.0
 
 # Counter selection for gfx942 (MI300A)
 
-Draft of the hardware counters collected in `validation` mode (contract section 13). It is the input
+Draft of the hardware counters collected in `profile` mode (contract section 13). It is the input
 for the pass planner (`tools/plan_counter_passes.sh`, not implemented yet) and the starting point for
 the literature-based justification of the selection.
 
@@ -33,7 +33,7 @@ were considered and left out (see below).
 
 ## Expected signatures of the current benchmarks
 
-What the validation mode should show if a benchmark does what it claims (to be checked on the GPU):
+What the profile mode should show if a benchmark does what it claims (to be checked on the GPU):
 
 | Benchmark | Expected signature |
 |---|---|
@@ -195,10 +195,10 @@ Formulas evaluated by rocprofv3. Only `MeanOccupancyPerCU` and `VmemLatency` are
 
 - **Number of passes:** how many counters fit into one pass depends on the counter registers per
   hardware block (SQ, TCP, TCC, ...). The pass planner determines this on the system by trying
-  combinations; the number of passes, and with it the duration of `validation` mode, is not known yet.
+  combinations; the number of passes, and with it the duration of `profile` mode, is not known yet.
 - **Literature:** the selection follows rocprof-compute. For the thesis it should be compared with
   the counters used in power and performance models (e.g. Guerreiro et al., AccelWattch) and reduced
-  or extended accordingly; the PCA on validation data can show which counters are redundant.
+  or extended accordingly; the PCA on profile data can show which counters are redundant.
 - **Infinity Cache:** no counter block on gfx942 (contract section 13, limitations).
 - **Formulas in the analysis:** the six formulas that are not collected must be reproduced in the
   analysis with the definitions of `rocprofv3 --list-avail` (e.g. `MfmaUtil` above); constants such

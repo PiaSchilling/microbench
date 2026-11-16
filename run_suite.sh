@@ -5,7 +5,7 @@
 # Implemented:   modes, run/component config, metadata, validation, plan,
 #                execution, contract check, results (JSONL/CSV/TSV), repetitions,
 #                aggregation, timeout, signal handling, help, telemetry (sampler),
-#                hardware counters (rocprofv3 passes, validation mode)
+#                hardware counters (rocprofv3 passes, profile mode)
 
 set -uo pipefail
 
@@ -18,8 +18,8 @@ source "$LIB/common.sh"
 # Defaults
 # ---------------------------------------------------------------------------
 
-declare -A MODE_DURATION=([check]=0.001 [validation]=10 [production]=120)
-declare -A MODE_PAUSE=([check]=0 [validation]=30 [production]=30)
+declare -A MODE_DURATION=([check]=0.001 [profile]=10 [production]=120)
+declare -A MODE_PAUSE=([check]=0 [profile]=30 [production]=30)
 TIMEOUT_FACTOR=2        # per-run timeout = duration * factor + offset
 TIMEOUT_OFFSET=60
 KILL_AFTER=10           # SIGKILL this many seconds after SIGTERM on timeout
@@ -80,32 +80,32 @@ declare -A COUNT=([ok]=0 [skipped]=0 [error]=0 [invalid]=0 [timeout]=0)
 
 usage() {
     cat <<EOF
-Usage: run_suite.sh --mode check|validation|production [options]
+Usage: run_suite.sh --mode check|profile|production [options]
        run_suite.sh --list
        run_suite.sh --help [<benchmark>]
 
 Modes:
   check        every run with a minimal duration: do all benchmarks work and
                comply with the contract? (no monitoring)
-  validation   medium duration, telemetry + hardware counters
+  profile      medium duration, telemetry + hardware counters
   production   long duration, telemetry only
-  In validation mode every run is repeated once per counter pass (pass 1..K)
+  In profile mode every run is repeated once per counter pass (pass 1..K)
   under rocprofv3; the counters of the ROI are written to counters.csv.
 
 Options:
   --config <file>       run config                (default: config/runs.cfg)
   --component <file>    component config          (default: config/component.cfg)
-  --duration <s>        value for {DURATION}      (default: check ${MODE_DURATION[check]}, validation ${MODE_DURATION[validation]}, production ${MODE_DURATION[production]})
+  --duration <s>        value for {DURATION}      (default: check ${MODE_DURATION[check]}, profile ${MODE_DURATION[profile]}, production ${MODE_DURATION[production]})
                         in check mode it applies to all runs, also fixed values
-  --pause <s>           pause between runs        (default: check ${MODE_PAUSE[check]}, validation ${MODE_PAUSE[validation]}, production ${MODE_PAUSE[production]})
+  --pause <s>           pause between runs        (default: check ${MODE_PAUSE[check]}, profile ${MODE_PAUSE[profile]}, production ${MODE_PAUSE[production]})
   --repeat <n>          repetitions, run in rounds (default: 1)
   --shuffle [<seed>]    shuffle the order within each round (default seed: $DEFAULT_SEED)
   --only <l1,l2,...>    run only these labels
   --device <n>          GPU index, set as HIP_VISIBLE_DEVICES (default: 0)
   --timeout <s>         per-run timeout           (default: duration x $TIMEOUT_FACTOR + $TIMEOUT_OFFSET)
-  --sample-interval <ms> telemetry interval       (default: $SAMPLE_INTERVAL; validation/production)
+  --sample-interval <ms> telemetry interval       (default: $SAMPLE_INTERVAL; profile/production)
   --idle <s>            idle baseline before the first run (default: $IDLE_SECONDS; 0: none)
-  --counters <file>     counter passes            (default: config/counters_<arch>.cfg; validation)
+  --counters <file>     counter passes            (default: config/counters_<arch>.cfg; profile)
                         create it with tools/plan_counter_passes.sh
   --rocprof <cmd>       profiler                  (default: $ROCPROF)
   --profile-duration <s> --duration of the benchmark in each counter pass (default: $PROFILE_DURATION)
@@ -172,7 +172,7 @@ help_benchmark() {
     local first=1
     for k in "${ord[@]}"; do
         [[ $k == expect_* && -n ${m[$k]} ]] || continue
-        ((first)) && printf '\nExpectations (validation mode):\n' && first=0
+        ((first)) && printf '\nExpectations (profile mode):\n' && first=0
         printf '  %-20s %s\n' "$k" "${m[$k]}"
     done
 }
@@ -261,7 +261,7 @@ parse_args() {
     if ((DO_LIST)); then list_benchmarks; exit 0; fi
 
     [[ -n $MODE ]] || die "--mode is required (see --help)"
-    [[ -v MODE_DURATION[$MODE] ]] || die "unknown mode '$MODE' (check, validation, production)"
+    [[ -v MODE_DURATION[$MODE] ]] || die "unknown mode '$MODE' (check, profile, production)"
     [[ -z $OPT_DURATION ]] || { is_number "$OPT_DURATION" && positive "$OPT_DURATION"; } ||
         die "--duration must be a positive number"
     [[ -z $OPT_PAUSE ]] || is_number "$OPT_PAUSE" || die "--pause must be a number >= 0"
@@ -482,8 +482,8 @@ check_param_defaults() {
     done
 }
 
-# counter passes (validation mode, contract section 13)
-profiling() { [[ $MODE == validation ]]; }
+# counter passes (profile mode, contract section 13)
+profiling() { [[ $MODE == profile ]]; }
 
 # load_counters: read the counter config into PASS_SETS and WMEAN
 load_counters() {

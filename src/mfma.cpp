@@ -13,7 +13,7 @@
 // param.precision=fp64|see precisions|Input type of the MFMA instruction (fp16, bf16, fp8: accumulation in fp32; int8: in int32)
 // param.iters=2000|>= 1|MFMA instructions per wavefront and launch (2000 as in rocprof-compute)
 //
-// # Expectations (validation mode). To be confirmed with a disassembly (--save-temps).
+// # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa.fp64=v_mfma_f64_16x16x4_f64
 // # expect_isa.fp32=v_mfma_f32_32x32x2_f32
 // # expect_isa.fp16=v_mfma_f32_32x32x8_f16
