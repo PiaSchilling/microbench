@@ -86,6 +86,11 @@ Field definitions: contract, Sections 5, 10 and 13.
 - `counters.csv` covers only kernel launches that lie completely inside the timed region
   (ROI) of a run, not warm-up, initialization or the gaps between runs.
 - Telemetry (`power_w`) is the socket power of the APU, including the CPU part.
+- Throttling (`m_ppt_viol_pct`, `m_thm_viol_pct`) comes from firmware residency counters.
+  On some nodes or firmware states the firmware does not report them (`amd-smi metric --violation`
+  shows N/A); the columns are then empty (`-`). Throttling is still visible in
+  `m_avg_gfx_clk_mhz` (clock below the maximum of ~2100 MHz) together with `m_avg_power_w`
+  near the power limit (760 W on the MI300A).
 - No Slurm integration yet: run on an allocated GPU node.
 
 ## Repository layout
