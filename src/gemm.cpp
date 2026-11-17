@@ -1,49 +1,38 @@
-// gemm.cpp -- Matrixmultiplikation C = A * B (Proxy-Kernel GEMM), geblockt oder naiv
+// ---- benchmark metadata ----
+// benchmark=gemm
+// level=2
+// component=GPU/Compute/VALU
+// description=Matrix multiplication C = A * B on the VALU (blocked with LDS tiles, or naive); K shifts the load between memory and compute
+// tags=gemm;lds
+// version=0.3.1
+// precisions=fp64,fp32,fp16,int8,int16,int32,int64
+// extra_build_flags=
 //
-// Bauen:   hipcc -O3 -std=c++17 --offload-arch=gfx942 gemm.cpp -o gemm
-// Starten: ./gemm --duration 30 --precision fp64 --m 8192 --n 8192 --k 256
-//          ./gemm --duration 30 --precision fp32 --size 4096 --kernel naive
+// # param.<name>=<default>|<valid values>|<effect>
+// param.duration=required|> 0 (seconds)|Length of the timed loop
+// param.kernel=blocked|blocked, naive|blocked: 128x128 tiles in LDS; naive: one thread per element of C
+// param.precision=fp64|see precisions|Input type of A and B (accumulation and output: see table in the source)
+// param.accumulate=native|native, fp32 (only with fp16)|Accumulation type; native: as in the table
+// param.size=4096|>= 1|Sets m = n = k (explicit --m/--n/--k take precedence)
+// param.m=4096|>= 1; blocked: multiple of 128|Rows of A and C
+// param.n=4096|>= 1; blocked: multiple of 128|Columns of B and C
+// param.k=4096|>= 1|Columns of A, rows of B; controls the arithmetic intensity of the blocked kernel
 //
-// Argumente (alle optional):
-//   --duration <s>       Ziel-Laufzeit der Zeitschleife                       (30)
-//   --kernel <k>         blocked | naive                                      (blocked)
-//   --precision <p>      Datentypen, siehe Tabelle                            (fp64)
-//   --size <n>           setzt M = N = K = n                                  (4096)
-//   --m / --n / --k <n>  einzelne Dimensionen, C[MxN] = A[MxK] * B[KxN]
-//                        blocked: M und N muessen Vielfache von 128 sein, K ist beliebig
+// # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
+// # expect_isa.fp64=v_fma_f64
+// expect_counters=
+// ---- end metadata ----
 //
-//   precision    Eingabe   Akkumulation   Ausgabe
-//   fp64         fp64      fp64           fp64
-//   fp32         fp32      fp32           fp32
-//   fp16         fp16      fp16           fp16
-//   fp16_acc32   fp16      fp32           fp16
-//   int8         int8      int32          int32
-//   int16        int16     int32          int32
-//   int32        int32     int32          int32
-//   int64        int64     int64          int64
-//
-// --kernel blocked (Standard): Jede Workgroup (256 Threads) berechnet eine TILE x TILE-Kachel von C. Sie laedt
-// dafuer ihren Zeilenstreifen von A (TILE x K) und Spaltenstreifen von B (K x TILE) in
-// Stuecken von je einer Cache-Line Tiefe ins LDS, jeder Thread akkumuliert RT x RT Elemente in
-// Registern. Jedes geladene Element wird so TILE-mal wiederverwendet. Keine Matrix Cores.
-//
-// Verkehrsmodell "kernel_level" (exakt das, was der Kernel aus dem globalen Speicher laedt/schreibt):
-//   Bytes = s_in * (M*K * N/TILE + K*N * M/TILE) + s_out * M*N
-//   Flop  = 2 * M*N*K
-//   AI    = 2K / (s_in * 2K/TILE + s_out)          (unabhaengig von M und N)
-//   fp64:  AI = 16 K / (K + 64)   -> K steuert die AI von ~0.25 (K=1) bis gegen 16
-// Jede geladene Cache-Line wird voll genutzt, sofern K <= 128/s_in oder K ein Vielfaches
-// davon ist (sonst liegen die Zeilen von A nicht auf Line-Grenzen). Das Modell entspricht damit dem Verkehr
-// zwischen Kernel und L1/L2. Der HBM-Verkehr kann niedriger sein, wenn sich Workgroups
-// Streifen von A/B ueber L2 oder Infinity Cache teilen.
-//
-// --kernel naive: Ein Thread pro Element von C, ohne Kacheln und LDS. Jeder Thread liest seine
-// ganze Zeile von A und Spalte von B, die Wiederverwendung haengt allein von den Caches ab.
-// Verkehrsmodell "minimal": A, B und C je genau einmal. Das ist eine Untergrenze fuer den
-// echten Verkehr (Obergrenze fuer die AI); der tatsaechliche liegt um Groessenordnungen hoeher.
+// gemm: matrix multiplication C = A * B on the VALU (no Matrix Cores), blocked
+// with LDS tiles or naive. K sets the arithmetic intensity: small K is
+// memory-bound, large K compute-bound (Level 2).
+// Source: from sratch by Claude (Opus 5.5).
+// Details: docs/benchmarks.md#gemm
+// Interface: docs/benchmark_contract.md
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -137,6 +126,16 @@ static double now_s() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+using mono_clock = std::chrono::steady_clock;  // CLOCK_MONOTONIC on Linux
+using unix_clock = std::chrono::system_clock;  // Unix time
+
+static long long mono_ns(mono_clock::time_point t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+}
+static double unix_s(unix_clock::time_point t) {
+    return std::chrono::duration<double>(t.time_since_epoch()).count();
+}
+
 // Zufallswerte mit festem Seed. Floats: [-1, 1]. Integer: [-8, 8], damit auch bei grossem K
 // kein Ueberlauf im Akkumulator entsteht (|Summe| <= 64*K).
 template <typename T>
@@ -207,8 +206,14 @@ static int run(double duration, bool naive, int M, int N, int K,
     const char* kernel = naive ? "naive" : "blocked";
     const char* model  = naive ? "minimal" : "kernel_level";
     const dim3 grid = naive ? dim3((unsigned)((MN + TPB - 1) / TPB)) : dim3(N / TILE, M / TILE);
-    fprintf(stderr, "kernel=%s precision=%s M=%d N=%d K=%d grid=%ux%u threads=%d\n",
-            kernel, precision, M, N, K, grid.x, grid.y, TPB);
+
+    hipDeviceProp_t prop;
+    HIP_CHECK(hipGetDeviceProperties(&prop, 0));
+    char pci[32];
+    snprintf(pci, sizeof pci, "%04x:%02x:%02x.0",
+             (unsigned)prop.pciDomainID, (unsigned)prop.pciBusID, (unsigned)prop.pciDeviceID);
+    fprintf(stderr, "gemm: device %s (%s), kernel=%s precision=%s acc=%s M=%d N=%d K=%d grid=%ux%u threads=%d\n",
+            prop.name, pci, kernel, precision, acc_s, M, N, K, grid.x, grid.y, TPB);
 
     std::vector<T>  h_A(a_el), h_B(b_el);
     std::vector<CT> h_C(MN);
@@ -241,16 +246,21 @@ static int run(double duration, bool naive, int M, int N, int K,
     t_one = now_s() - t_one;
     const long batch = std::clamp((long)(0.1 / std::max(t_one, 1e-9)), 1L, 1000L);
 
-    // Zeitschleife: Batches starten, bis duration erreicht ist
+    // Timed loop = ROI: batches until duration is reached, at least one
     long launches = 0;
-    double t0 = now_s(), elapsed = 0;
+    const unix_clock::time_point u0 = unix_clock::now();
+    const mono_clock::time_point t0 = mono_clock::now();
+    mono_clock::time_point t1;
+    double elapsed;
     do {
         for (long b = 0; b < batch; ++b) launch();
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
         launches += batch;
-        elapsed = now_s() - t0;
+        t1 = mono_clock::now();
+        elapsed = std::chrono::duration<double>(t1 - t0).count();
     } while (elapsed < duration);
+    const unix_clock::time_point u1 = unix_clock::now();
 
     // Verifikation (nach der Messung)
     HIP_CHECK(hipMemcpy(h_C.data(), d_C, MN * sizeof(CT), hipMemcpyDeviceToHost));
@@ -274,21 +284,28 @@ static int run(double duration, bool naive, int M, int N, int K,
     const double d_gflop_per_s = a_gflop / elapsed;
     const double d_gbyte_per_s = a_gbyte / elapsed;
 
-    fprintf(stderr, "kernel=%s precision=%s M=%d N=%d K=%d  %ld Starts  %.2f s  %.1f %s  AI=%.2f  max_rel_err=%.2e\n",
-            kernel, precision, M, N, K, launches, elapsed, d_gflop_per_s, unit, a_intensity, max_rel_err);
+    fprintf(stderr, "gemm: kernel=%s precision=%s acc=%s M=%d N=%d K=%d  %ld launches  %.3f s  %.1f %s  AI=%.2f  max_rel_err=%.2e\n",
+            kernel, precision, acc_s, M, N, K, launches, elapsed, d_gflop_per_s, unit, a_intensity, max_rel_err);
 
     char err_s[32], tol_s[32];
     json_num(err_s, sizeof err_s, max_rel_err, "%.3e");
     json_num(tol_s, sizeof tol_s, tol, "%.3e");
-    printf("{\"runtime_s\": %.6f, \"iterations\": %ld, "
-           "\"a_gflop\": %.6f, \"a_gbyte\": %.6f, \"a_intensity\": %.6f, "
-           "\"d_gflop_per_s\": %.3f, \"d_gbyte_per_s\": %.3f, \"verify_ok\": %s, "
+    printf("{\"runtime_s\": %.9f, \"iterations\": %ld, "
+           "\"roi_start_unix\": %.6f, \"roi_end_unix\": %.6f, "
+           "\"roi_start_mono_ns\": %lld, \"roi_end_mono_ns\": %lld, "
+           "\"e_pci_bus_id\": \"%s\", "
+           "\"a_gflop\": %.9g, \"a_gbyte\": %.9g, \"a_intensity\": %.9g, "
+           "\"d_gflop_per_s\": %.9g, \"d_gbyte_per_s\": %.9g, \"verify_ok\": %s, "
            "\"precision\": \"%s\", \"op_type\": \"%s\", \"kernel\": \"%s\", \"traffic_model\": \"%s\", "
            "\"input_precision\": \"%s\", \"acc_precision\": \"%s\", \"output_precision\": \"%s\", "
-           "\"m\": %d, \"n\": %d, \"k\": %d, \"tile\": %d, \"max_rel_err\": %s, \"tolerance\": %s}\n",
-           elapsed, launches, a_gflop, a_gbyte, a_intensity,
+           "\"m\": %d, \"n\": %d, \"k\": %d, \"tile\": %d, \"max_rel_err\": %s, \"tolerance\": %s, "
+           "\"e_batch\": %ld, \"e_grid_x\": %u, \"e_grid_y\": %u, \"e_threads\": %d}\n",
+           elapsed, launches, unix_s(u0), unix_s(u1), mono_ns(t0), mono_ns(t1), pci,
+           a_gflop, a_gbyte, a_intensity,
            d_gflop_per_s, d_gbyte_per_s, ok ? "true" : "false",
-           precision, op_type, kernel, model, in_s, acc_s, out_s, M, N, K, naive ? 1 : TILE, err_s, tol_s);
+           precision, op_type, kernel, model, in_s, acc_s, out_s, M, N, K, naive ? 1 : TILE, err_s, tol_s,
+           batch, grid.x, grid.y, TPB);
+    fflush(stdout);
 
     HIP_CHECK(hipFree(d_A));
     HIP_CHECK(hipFree(d_B));
@@ -296,63 +313,117 @@ static int run(double duration, bool naive, int M, int N, int K,
     return ok ? 0 : 3;
 }
 
-// Dimension parsen: ganze Zahl in [1, INT_MAX], sonst Abbruch
-static int parse_dim(const char* name, const char* s) {
-    char* end = nullptr;
+// ---------------------------------------------------------------------------
+// Arguments (contract section 4)
+// ---------------------------------------------------------------------------
+
+static bool parse_double(const char* s, double* out) {
+    char* end;
+    errno = 0;
+    double v = strtod(s, &end);
+    if (errno || end == s || *end != '\0' || !std::isfinite(v)) return false;
+    *out = v;
+    return true;
+}
+
+// dimension: integer in [1, INT_MAX]
+static bool parse_dim(const char* s, int* out) {
+    char* end;
+    errno = 0;
     long v = strtol(s, &end, 10);
-    if (end == s || *end != '\0' || v < 1 || v > INT_MAX) {
-        fprintf(stderr, "%s must be an integer in [1, %d]: %s\n", name, INT_MAX, s);
-        exit(1);
-    }
-    return (int)v;
+    if (errno || end == s || *end != '\0' || v < 1 || v > INT_MAX) return false;
+    *out = (int)v;
+    return true;
 }
 
 int main(int argc, char** argv) {
-    double duration = 30.0;
+    double duration = 0;
     const char* precision = "fp64";
     const char* kernel = "blocked";
-    int M = 4096, N = 4096, K = 4096;
-    for (int i = 1; i < argc; i += 2) {
-        if (i + 1 >= argc) { fprintf(stderr, "Argument without value: %s\n", argv[i]); return 1; }
-        if      (!strcmp(argv[i], "--duration"))  duration = atof(argv[i + 1]);
-        else if (!strcmp(argv[i], "--precision")) precision = argv[i + 1];
-        else if (!strcmp(argv[i], "--kernel"))    kernel = argv[i + 1];
-        else if (!strcmp(argv[i], "--size"))      M = N = K = parse_dim("--size", argv[i + 1]);
-        else if (!strcmp(argv[i], "--m"))         M = parse_dim("--m", argv[i + 1]);
-        else if (!strcmp(argv[i], "--n"))         N = parse_dim("--n", argv[i + 1]);
-        else if (!strcmp(argv[i], "--k"))         K = parse_dim("--k", argv[i + 1]);
-        else { fprintf(stderr, "Unknown argument: %s\n", argv[i]); return 1; }
+    const char* accumulate = "native";
+    int size = 4096, M = 0, N = 0, K = 0;              // 0: not given, use size
+    bool check = false;
+    bool seen[8] = {false};
+    static const char* const keys[8] = {"--duration", "--precision", "--kernel", "--accumulate",
+                                        "--size", "--m", "--n", "--k"};
+
+    for (int i = 1; i < argc; ++i) {
+        const char* key = argv[i];
+        if (!strcmp(key, "--check")) { check = true; continue; }
+        int which = -1;
+        for (int w = 0; w < 8; ++w) if (!strcmp(key, keys[w])) which = w;
+        if (which < 0) { fprintf(stderr, "gemm: unknown option %s\n", key); return 1; }
+        if (i + 1 >= argc) { fprintf(stderr, "gemm: option %s requires a value\n", key); return 1; }
+        if (seen[which]) { fprintf(stderr, "gemm: %s given twice\n", key); return 1; }
+        seen[which] = true;
+        const char* val = argv[++i];
+        bool valid = true;
+        switch (which) {
+            case 0: valid = parse_double(val, &duration) && duration > 0; break;
+            case 1: precision = val; break;
+            case 2: kernel = val; break;
+            case 3: accumulate = val; break;
+            case 4: valid = parse_dim(val, &size); break;
+            case 5: valid = parse_dim(val, &M); break;
+            case 6: valid = parse_dim(val, &N); break;
+            case 7: valid = parse_dim(val, &K); break;
+        }
+        if (!valid) {
+            fprintf(stderr, "gemm: invalid value for %s: '%s' (see: run_suite.sh --help gemm)\n", key, val);
+            return 1;
+        }
     }
-    if (duration <= 0) { fprintf(stderr, "--duration must be > 0 \n"); return 1; }
+    if (!seen[0]) { fprintf(stderr, "gemm: --duration is required\n"); return 1; }
+    if (M == 0) M = size;
+    if (N == 0) N = size;
+    if (K == 0) K = size;
+
     bool naive;
     if      (!strcmp(kernel, "blocked")) naive = false;
     else if (!strcmp(kernel, "naive"))   naive = true;
-    else { fprintf(stderr, "--kernel '%s' not supported (blocked, naive)\n", kernel); return 1; }
+    else { fprintf(stderr, "gemm: --kernel '%s' is not valid (blocked, naive)\n", kernel); return 1; }
     if (naive) {
-        if (((size_t)M * N + TPB - 1) / TPB > UINT_MAX) { fprintf(stderr, "M*N too big for the grid\n"); return 1; }
+        if (((size_t)M * N + TPB - 1) / TPB > UINT_MAX) { fprintf(stderr, "gemm: M*N too large for the grid\n"); return 1; }
     } else {
         if (M % TILE != 0 || N % TILE != 0) {
-            fprintf(stderr, "--m and --n must be multiples of %d for --kernel blocked (got M=%d, N=%d)\n",
+            fprintf(stderr, "gemm: --m and --n must be multiples of %d for --kernel blocked (got M=%d, N=%d)\n",
                     TILE, M, N);
             return 1;
         }
-        if (M / TILE > 65535) { fprintf(stderr, "--m too big (max %d)\n", 65535 * TILE); return 1; }
+        if (M / TILE > 65535) { fprintf(stderr, "gemm: --m too large (max %d)\n", 65535 * TILE); return 1; }
     }
+
+    const bool acc32 = !strcmp(accumulate, "fp32");
+    if (!acc32 && strcmp(accumulate, "native")) {
+        fprintf(stderr, "gemm: --accumulate '%s' is not valid (native, fp32)\n", accumulate);
+        return 1;
+    }
+    if (acc32 && strcmp(precision, "fp16")) {
+        fprintf(stderr, "gemm: --accumulate fp32 is only available with --precision fp16\n");
+        return 1;
+    }
+
+    static const char* const precisions[] = {"fp64", "fp32", "fp16", "int8", "int16", "int32", "int64"};
+    bool known = false;
+    for (const char* p : precisions) known = known || !strcmp(precision, p);
+    if (!known) {
+        fprintf(stderr, "gemm: --precision '%s' is not valid (fp64, fp32, fp16, int8, int16, int32, int64)\n",
+                precision);
+        return 1;
+    }
+    if (check) return 0;                       // arguments valid, no GPU access
 
 #define RUN(T, ACC, CT, IN_S, ACC_S, OUT_S) \
     return run<T, ACC, CT>(duration, naive, M, N, K, precision, IN_S, ACC_S, OUT_S)
 
-    if      (!strcmp(precision, "fp64"))       RUN(double,   double,   double,   "fp64",  "fp64",  "fp64");
-    else if (!strcmp(precision, "fp32"))       RUN(float,    float,    float,    "fp32",  "fp32",  "fp32");
-    else if (!strcmp(precision, "fp16"))       RUN(_Float16, _Float16, _Float16, "fp16",  "fp16",  "fp16");
-    else if (!strcmp(precision, "fp16_acc32")) RUN(_Float16, float,    _Float16, "fp16",  "fp32",  "fp16");
-    else if (!strcmp(precision, "int8"))       RUN(int8_t,   int32_t,  int32_t,  "int8",  "int32", "int32");
-    else if (!strcmp(precision, "int16"))      RUN(int16_t,  int32_t,  int32_t,  "int16", "int32", "int32");
-    else if (!strcmp(precision, "int32"))      RUN(int32_t,  int32_t,  int32_t,  "int32", "int32", "int32");
-    else if (!strcmp(precision, "int64"))      RUN(int64_t,  int64_t,  int64_t,  "int64", "int64", "int64");
+    if      (!strcmp(precision, "fp64"))  RUN(double,   double,   double,   "fp64",  "fp64",  "fp64");
+    else if (!strcmp(precision, "fp32"))  RUN(float,    float,    float,    "fp32",  "fp32",  "fp32");
+    else if (!strcmp(precision, "fp16") && acc32)
+                                          RUN(_Float16, float,    _Float16, "fp16",  "fp32",  "fp16");
+    else if (!strcmp(precision, "fp16"))  RUN(_Float16, _Float16, _Float16, "fp16",  "fp16",  "fp16");
+    else if (!strcmp(precision, "int8"))  RUN(int8_t,   int32_t,  int32_t,  "int8",  "int32", "int32");
+    else if (!strcmp(precision, "int16")) RUN(int16_t,  int32_t,  int32_t,  "int16", "int32", "int32");
+    else if (!strcmp(precision, "int32")) RUN(int32_t,  int32_t,  int32_t,  "int32", "int32", "int32");
+    else                                  RUN(int64_t,  int64_t,  int64_t,  "int64", "int64", "int64");
 #undef RUN
-
-    fprintf(stderr, "--precision '%s' not supported "
-                    "(fp64, fp32, fp16, fp16_acc32, int8, int16, int32, int64)\n", precision);
-    return 1;
 }
