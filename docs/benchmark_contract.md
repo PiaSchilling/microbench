@@ -216,7 +216,7 @@ Line-based `key=value`, `#` for comment lines. Parsed line by line, not executed
 # MI300A (gfx942)
 arch=gfx942
 gpus=4
-precisions=fp64,fp32,fp16,int64,int32,int16,int8
+precisions=fp64,fp32,tf32,fp16,bf16,fp8,int64,int32,int16,int8
 
 # Memory hierarchy, in bytes
 lds_bytes_per_cu=65536
