@@ -9,6 +9,7 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [fma](#fma) | 1 | VALU | peak vector throughput per precision |
 | [mfma](#mfma) | 1 | Matrix Cores | peak matrix throughput per precision |
 | [copy](#copy) | 1 | HBM | bandwidth (read + write) |
+| [read](#read) | 1 | HBM | read bandwidth |
 | [reuse](#reuse) | 1 | L1, L2, LLC | read bandwidth per cache level |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
 | [gemm](#gemm) | 2 | VALU, LDS, memory | load shifted between memory and compute via K |
@@ -71,6 +72,28 @@ overhead does not dominate for small arrays.
 
 **History.** Named `stream` until 2026-11-10; renamed because it is only the Copy kernel of
 STREAM, not the full benchmark with Copy, Scale, Add and Triad. Behaviour unchanged.
+
+## read
+
+**Kernel.** `HBM_bw`, taken from the roofline benchmark of rocprofiler-compute,
+github.com/ROCm/rocm-systems, branch develop, commit 787f6e7 (2026-11-17),
+`projects/rocprofiler-compute/src/roofline/benchmark/gfx9/benchmark_gfx9_base.py`. Every thread
+reads its own 16-byte elements (`__uint128_t`) in a grid-stride loop with
+`__builtin_nontemporal_load`, 16 loads per step; the results are combined with a bitwise OR, so
+there is no floating-point work (`a_gflop = 0`). Each byte is read once per launch: no reuse, no
+writes. Launch configuration as there: 256 threads per block, 128 blocks per CU, 4 GiB requested,
+rounded up to whole steps (blocks × 256 threads × 16 loads × 16 B, ≈ 1.9 GB per step on the
+MI300A, so 4 GiB become ≈ 5.7 GB).
+
+**Why not `reuse` with an HBM-sized buffer.** In `reuse` every block reads the same buffer; with a
+buffer larger than the Infinity Cache, thousands of blocks would read the same addresses at about
+the same time and hit in L2 or the Infinity Cache instead of HBM.
+
+**Changes for this suite.** Compiled ahead of time instead of hiprtc; kernel without
+`extern "C"`; time loop over `--duration` with ROI time stamps and JSON output; argument check;
+the buffer is filled with a non-zero pattern (the kernel stores to `src[0]` only if all loaded
+values are zero; rocprof-compute reads uninitialized memory); no verification (`verify_ok = null`).
+License: MIT (notice in the source file).
 
 ## reuse
 
