@@ -12,7 +12,7 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [read](#read) | 1 | HBM | read bandwidth |
 | [reuse](#reuse) | 1 | L1, L2, LLC | read bandwidth per cache level |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
-| [gather](#gather) | 1 | L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
+| [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
 | [gemm](#gemm) | 2 | VALU, LDS, memory | load shifted between memory and compute via K |
 
 ## fma
@@ -132,32 +132,38 @@ the vector L1 (not the scalar cache).
 
 ## gather
 
-**Kernel.** Own implementation. Every thread reads one element of the table `t` at the address
-given by an index array and stores it contiguously: `a[i] = t[idx[i]]` (fp64). The accesses are
-independent of each other; this is the counterpart of `chase`, where every access depends on the
-previous one. Gather/scatter as an access type is standard (vector machines, HPC Challenge
-RandomAccess, Uwe Küster's loops); no code was taken over (the HPCC RandomAccess code has no
-license).
+**Kernel.** Own implementation. The threads read elements of the table `t` at the addresses
+given by an index array, `t[idx[k]]` (fp64), and sum them; every thread stores its sum once
+(contiguous). The accesses are independent of each other; this is the counterpart of `chase`,
+where every access depends on the previous one. Gather/scatter as an access type is standard
+(vector machines, HPC Challenge RandomAccess, Uwe Küster's loops); no code was taken over (the
+HPCC RandomAccess code has no license).
 
 **Index.** The index visits every `stride`-th element of `t` exactly once (default stride 128 B =
 one access per cache line). `--pattern strided`: the lines in address order. `--pattern random`:
 the same lines in a random permutation (Fisher–Yates, fixed seed), without duplicates. Both
 patterns therefore touch the same lines with the same number of accesses; only the order differs.
 
-**Memory level.** Selected by `--working_set_bytes` (size of `t`), as in `chase`. For tables up to
-64 MiB the kernel repeats the access `passes` times per launch (pass `p` reads the element `p`
-strides after its own, so the order is kept), so that a launch is not dominated by the launch
-overhead; above 64 MiB there is one pass, so that HBM runs do not hit data from the previous pass
-in the caches.
+**Grid and memory level.** Fixed grid as in `read` and `reuse`: 128 blocks per CU × 256 threads,
+independent of the table size. The threads run a grid-stride loop over the accesses `k` of one
+launch; access `k` reads `t[idx[k mod n]]` (`n` = index length; the position is advanced
+incrementally, without a division per access). The memory level is selected by
+`--working_set_bytes` (size of `t`), as in `chase`:
+- tables up to 64 MiB (L1, L2, LLC): a whole number of rounds over the index, about 16 accesses
+  per thread; all CUs read the whole table many times, so it stays in the target cache (the same
+  principle as `reuse`). Without this, a 2 MiB table with one access per line would give only
+  16 384 accesses, i.e. 64 blocks for 228 CUs (fixed in version 0.2.0);
+- larger tables (HBM): every element once per launch.
 
-**Bytes.** Nominal: 8 B per access (table) plus 4 B index and 8 B result per thread and launch.
-The hardware moves whole cache lines; with one access per line (stride 128 B) the moved bytes
-are up to 16 times the nominal bytes, for both patterns. The difference between strided and
+**Bytes.** Nominal: 8 B table + 4 B index per access, plus 8 B result per thread and launch.
+The hardware moves whole cache lines; with one access per line (stride 128 B) and a table larger
+than the caches, the bytes moved from HBM are up to 16 times the nominal table bytes, for both
+patterns. The difference between strided and
 random therefore comes from the order (DRAM page locality, prefetching), not from the amount. The counters show the difference (an example for the
 roofline question: nominal intensity and actual traffic diverge). The extra field
 `d_gaccess_per_s` gives the accesses per second (comparable to GUPS).
 
-**Verification.** A sample of 1000 results is recomputed on the host.
+**Verification.** The sums of a sample of 1000 threads are recomputed on the host.
 
 **Related benchmarks (planned).** Level 1, each as its own small benchmark: `scatter`
 (irregular writes, together with the write bandwidth) and `atomic` (atomic read-modify-write,
@@ -165,7 +171,7 @@ executed in the L2). Level 2, from Uwe's loops: combinations and realistic varia
 updates with duplicates and a conflict rate (`random_accumulate` vs. `_fake`, HPCC RandomAccess
 style XOR updates), `random_axpy`, several indirect streams.
 
-**Strided vs. random per level.** Both patterns run for L2, LLC and HBM. Expected: a large
+**Strided vs. random per level.** Both patterns run for L1, L2, LLC and HBM. Expected: a large
 difference in HBM (DRAM page locality, prefetching), a small one in the caches (at most
 address-translation effects); the runs check this assumption.
 
