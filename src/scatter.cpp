@@ -2,9 +2,9 @@
 // benchmark=scatter
 // level=1
 // component=GPU/Memory/Bandwidth
-// description=Indirect write t[idx[k]] = b[k] (scatter) of 16-byte elements, independent accesses; strided or random order of the cache lines; bandwidth of irregular writes per memory level
+// description=Indirect write t[idx[k]] = value(k) (scatter) of 16-byte elements, independent accesses, no data reads (only the index); strided or random order of the cache lines; bandwidth of irregular writes per memory level
 // tags=memory-bound;bandwidth;irregular;write
-// version=0.2.0
+// version=0.3.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
@@ -18,14 +18,16 @@
 // expect_counters=
 // ---- end metadata ----
 //
-// scatter: the threads read an input array b in order and write its 16-byte elements to
-// the table t at the addresses given by an index array (t[idx[k]] = b[k]); the
-// accesses are independent of each other. Same index as gather: every stride-th
-// element of t once, in address order (strided) or in a random order (random).
-// Fixed grid (128 blocks per CU); small tables are written many times per launch
-// (always with the same values), large ones once. Measures the bandwidth of
-// irregular writes per memory level; the counterpart of gather.
-// Source: own implementation (scatter as in Uwe Kuester's loops: a(index(i)) = b(i)).
+// scatter: the threads write 16-byte elements (the widest store per lane) to the
+// table t at the addresses given by an index array (t[idx[k]] = value(k)); the
+// value is computed from k, so apart from the index nothing is read (mirror image
+// of gather: 16 B irregular read + 4 B index there, 16 B irregular write + 4 B
+// index here). Same index as gather: every stride-th element of t once, in address
+// order (strided) or in a random order (random). Fixed grid (128 blocks per CU);
+// small tables are written many times per launch (always with the same values),
+// large ones once. Measures irregular writes per memory level.
+// Source: own implementation. Uwe Kuester's form a(index(i)) = b(i) (with a read
+// stream b) combines two patterns and belongs to Level 2.
 // Details: docs/benchmarks.md#scatter
 // Interface: docs/benchmark_contract.md
 
@@ -57,7 +59,7 @@ static const unsigned long long ACCESSES_PER_THREAD = 16;    // for tables up to
 static const unsigned ELEM_BYTES = 16;                       // sizeof(uint4), widest store per lane
 static const unsigned UNTOUCHED = 0xFFFFFFFFu;               // initial value of every word of t (checked after the run)
 
-// Value of input element k (also computed on the host for verification)
+// Value written by access k (also computed on the host for verification)
 __host__ __device__ inline uint4 value(unsigned long k) {
     const unsigned lo = (unsigned)k, hi = (unsigned)(k >> 32);
     return make_uint4(lo, hi, lo ^ 0xA5A5A5A5u, ~lo);
@@ -67,18 +69,18 @@ static bool same(const uint4& a, const uint4& b) {
 }
 
 // Grid-stride loop over the accesses k = 0 .. m-1 of one launch; access k writes
-// b[k mod n] to t[idx[k mod n]]. b is read in order (coalesced), t is written
+// value(k mod n) to t[idx[k mod n]]. Only the index is read (in order); t is written
 // irregularly. The position in the index (k mod n) is advanced incrementally, so
 // no 64-bit division per access limits the throughput. In the cache runs the same
 // element of t is written several times per launch, always with the same value.
-__global__ void scatter(uint4* t, const unsigned int* idx, const uint4* b,
+__global__ void scatter(uint4* t, const unsigned int* idx,
                         unsigned long n, unsigned long m) {
     const unsigned long tid = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned long g = (unsigned long)gridDim.x * blockDim.x;
     const unsigned long g_mod = g % n;
     unsigned long pos = tid % n;
     for (unsigned long k = tid; k < m; k += g) {
-        t[idx[pos]] = b[pos];                  // regular read, irregular write
+        t[idx[pos]] = value(pos);              // irregular write, value from the position
         pos += g_mod;
         if (pos >= n) pos -= n;
     }
@@ -193,25 +195,20 @@ int main(int argc, char** argv) {
     }
     for (unsigned long long k = 0; k < n; ++k) h_idx[k] = (unsigned int)(h_idx[k] * stride_elems);
 
-    // Input b[k] = value(k), so every value says where it came from.
-    std::vector<uint4> h_b(n);
-    for (unsigned long long k = 0; k < n; ++k) h_b[k] = value(k);
     // Table t starts with UNTOUCHED everywhere; elements between the strides stay so.
     const uint4 untouched = make_uint4(UNTOUCHED, UNTOUCHED, UNTOUCHED, UNTOUCHED);
     std::vector<uint4> h_t(table_elems, untouched);
 
-    uint4 *d_t, *d_b;
+    uint4* d_t;
     unsigned int* d_idx;
     HIP_CHECK(hipMalloc(&d_t, table_elems * sizeof(uint4)));
     HIP_CHECK(hipMalloc(&d_idx, n * sizeof(unsigned int)));
-    HIP_CHECK(hipMalloc(&d_b, n * sizeof(uint4)));
     HIP_CHECK(hipMemcpy(d_t, h_t.data(), table_elems * sizeof(uint4), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_idx, h_idx.data(), n * sizeof(unsigned int), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_b, h_b.data(), n * sizeof(uint4), hipMemcpyHostToDevice));
 
     // Warmup (not part of the ROI)
     hipLaunchKernelGGL(scatter, dim3(blocks), dim3(THREADS), 0, 0,
-                       d_t, (const unsigned int*)d_idx, (const uint4*)d_b,
+                       d_t, (const unsigned int*)d_idx,
                        (unsigned long)n, (unsigned long)m);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
@@ -224,7 +221,7 @@ int main(int argc, char** argv) {
     double elapsed;
     do {
         hipLaunchKernelGGL(scatter, dim3(blocks), dim3(THREADS), 0, 0,
-                           d_t, (const unsigned int*)d_idx, (const uint4*)d_b,
+                           d_t, (const unsigned int*)d_idx,
                            (unsigned long)n, (unsigned long)m);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
@@ -234,10 +231,10 @@ int main(int argc, char** argv) {
     } while (elapsed < duration);
     const unix_clock::time_point u1 = unix_clock::now();
 
-    // ---- verification: t[idx[k]] == b[k] for every k, every other element untouched ----
+    // ---- verification: t[idx[k]] == value(k) for every k, every other element untouched ----
     std::vector<uint4> h_out(table_elems);
     HIP_CHECK(hipMemcpy(h_out.data(), d_t, table_elems * sizeof(uint4), hipMemcpyDeviceToHost));
-    for (unsigned long long k = 0; k < n; ++k) h_t[h_idx[k]] = h_b[k];   // expected table
+    for (unsigned long long k = 0; k < n; ++k) h_t[h_idx[k]] = value(k);   // expected table
     bool ok = true;
     unsigned long long bad = 0;
     for (unsigned long long e = 0; e < table_elems; ++e)
@@ -247,10 +244,10 @@ int main(int argc, char** argv) {
                 bad, h_out[bad].x, h_t[bad].x);
 
     // ---- results; GB = 10^9 byte ----
-    // Nominal bytes: per access 16 B written to t + 16 B read from b + 4 B index.
+    // Nominal bytes: per access 16 B written to t + 4 B index.
     // The hardware moves whole cache lines; the difference shows in the counters.
     const double accesses = (double)launches * m;
-    const double a_gbyte = accesses * (2.0 * ELEM_BYTES + 4.0) / 1e9;
+    const double a_gbyte = accesses * (ELEM_BYTES + 4.0) / 1e9;
     const double a_gflop = 0.0;                            // no arithmetic
     const double a_intensity = a_gflop / a_gbyte;          // 0
 
@@ -274,6 +271,5 @@ int main(int argc, char** argv) {
 
     HIP_CHECK(hipFree(d_t));
     HIP_CHECK(hipFree(d_idx));
-    HIP_CHECK(hipFree(d_b));
     return ok ? 0 : 3;                          // contract section 7: 3 = verification failed
 }

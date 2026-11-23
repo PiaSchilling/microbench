@@ -209,27 +209,28 @@ address-translation effects); the runs check this assumption.
 
 ## scatter
 
-**Kernel.** Own implementation, the counterpart of `gather` (Uwe Küster's loop
-`a(index(i)) = b(i)`). The threads read an input array `b` in order (coalesced) and write each
-element to the table `t` at the address given by the index: `t[idx[k]] = b[k]` (16-byte `uint4`
-elements, the widest store per lane, see `gather`). The
-accesses are independent of each other; there is no arithmetic (`a_gflop = 0`).
+**Kernel.** Own implementation, the mirror image of `gather`. The threads write 16-byte elements
+(`uint4`, the widest store per lane, see `gather`) to the table `t` at the address given by the
+index: `t[idx[k]] = value(k)`. The value is computed from `k`, so apart from the index nothing is
+read: 16 B irregular write + 4 B index per access, as `gather` has 16 B irregular read + 4 B index.
+The accesses are independent of each other; there is no arithmetic (`a_gflop = 0`).
+Uwe Küster's form `a(index(i)) = b(i)` adds a sequential read stream `b`; that combines two access
+patterns and therefore belongs to Level 2 (version 0.2.0 still read `b`, changed 2026-11-23).
 
 **Index, grid, memory level.** Exactly as in `gather`: the index visits every `stride`-th element
 of `t` once, in address order (`strided`) or as a random permutation (`random`, same seed); fixed
 grid of 128 blocks per CU × 256 threads; tables up to 64 MiB are written in a whole number of
 rounds per launch (about 16 accesses per thread), larger ones once per launch. In the cache runs
 the same element of `t` is therefore written several times per launch, always with the same value
-`b[k]`; concurrent writes of the same value are harmless.
+`value(k)`; concurrent writes of the same value are harmless.
 
-**Bytes.** Nominal: 16 B written to `t` + 16 B read from `b` + 4 B index per access. With one
+**Bytes.** Nominal: 16 B written to `t` + 4 B index per access. With one
 access per line (stride 128 B) every write touches its own cache line and writes only 16 B of it;
 what the hardware moves (partial-line writes, possibly read-for-ownership) shows in the counters.
 `d_gaccess_per_s` gives the accesses per second.
 
-**Verification.** Every word of `t` is initialised with `0xFFFFFFFF`, `b[k]` holds a value derived
-from `k`. After the timed loop the whole table is
-compared with the expected one: `t[idx[k]] == b[k]` for every `k`, and every other element still
+**Verification.** Every word of `t` is initialised with `0xFFFFFFFF`. After the timed loop the
+whole table is compared with the expected one: `t[idx[k]] == value(k)` for every `k`, and every other element still
 untouched. This also detects writes to wrong positions.
 
 ## shared_read
