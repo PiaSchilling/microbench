@@ -10,6 +10,7 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [mfma](#mfma) | 1 | Matrix Cores | peak matrix throughput per precision |
 | [copy](#copy) | 1 | HBM | bandwidth (read + write) |
 | [read](#read) | 1 | HBM | read bandwidth |
+| [write](#write) | 1 | L2, LLC, HBM | write bandwidth |
 | [reuse](#reuse) | 1 | L1, L2, LLC | read bandwidth per cache level |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
 | [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
@@ -98,6 +99,25 @@ the same time and hit in L2 or the Infinity Cache instead of HBM.
 the buffer is filled with a non-zero pattern (the kernel stores to `src[0]` only if all loaded
 values are zero; rocprof-compute reads uninitialized memory); no verification (`verify_ok = null`).
 License: MIT (notice in the source file).
+
+## write
+
+**Kernel.** Own implementation, the counterpart of `read`. The threads store 16-byte elements
+(`uint4`, expected `global_store_dwordx4`) in a grid-stride loop; neighbouring lanes write
+neighbouring elements (coalesced). Nothing is read and there is no arithmetic (`a_gflop = 0`).
+Normal stores (not non-temporal), so the memory level is selected by the buffer size.
+
+**Grid and memory level.** Fixed grid as in `read` and `gather`: 128 blocks per CU × 256 threads.
+`--working_set_bytes` selects the level, as in `gather`: buffers up to 64 MiB are written in a whole
+number of rounds per launch (about 16 stores per thread, always the same value per element), larger
+buffers once per launch. No L1 run: the L1 is write-through, stores go on to the L2 (to be confirmed
+with the counters, see the scatter L1 runs). With 2 MiB every XCD writes the whole buffer into its
+own L2; the write-back at the end of each launch is small compared with the bytes per launch.
+
+**Bytes.** Nominal = bytes stored (16 B per store).
+
+**Verification.** Every element holds a value derived from its position (`value(e)`); after the
+timed loop the whole buffer is compared on the host.
 
 ## reuse
 
