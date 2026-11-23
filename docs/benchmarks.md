@@ -13,6 +13,7 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [reuse](#reuse) | 1 | L1, L2, LLC | read bandwidth per cache level |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
 | [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
+| [scatter](#scatter) | 1 | L1, L2, LLC, HBM | bandwidth of irregular writes (strided, random) |
 | [shared_read](#shared_read) | 1 | LDS | LDS read bandwidth |
 | [shared_read_rocprof](#shared_read_rocprof) | ref | LDS | reference only: rocprof-compute LDS kernel, for comparison with shared_read |
 | [gemm](#gemm) | 2 | VALU, LDS, memory | load shifted between memory and compute via K |
@@ -168,7 +169,7 @@ roofline question: nominal intensity and actual traffic diverge). The extra fiel
 **Verification.** The sums of a sample of 1000 threads are recomputed on the host.
 
 **Related benchmarks (planned).** Level 1, each as its own small benchmark: `scatter`
-(irregular writes, together with the write bandwidth) and `atomic` (atomic read-modify-write,
+(irregular writes, built 2026-11-23) and `atomic` (atomic read-modify-write,
 executed in the L2). Level 2, from Uwe's loops: combinations and realistic variants such as
 updates with duplicates and a conflict rate (`random_accumulate` vs. `_fake`, HPCC RandomAccess
 style XOR updates), `random_axpy`, several indirect streams.
@@ -176,6 +177,29 @@ style XOR updates), `random_axpy`, several indirect streams.
 **Strided vs. random per level.** Both patterns run for L1, L2, LLC and HBM. Expected: a large
 difference in HBM (DRAM page locality, prefetching), a small one in the caches (at most
 address-translation effects); the runs check this assumption.
+
+## scatter
+
+**Kernel.** Own implementation, the counterpart of `gather` (Uwe Küster's loop
+`a(index(i)) = b(i)`). The threads read an input array `b` in order (coalesced) and write each
+element to the table `t` at the address given by the index: `t[idx[k]] = b[k]` (fp64). The
+accesses are independent of each other; there is no arithmetic (`a_gflop = 0`).
+
+**Index, grid, memory level.** Exactly as in `gather`: the index visits every `stride`-th element
+of `t` once, in address order (`strided`) or as a random permutation (`random`, same seed); fixed
+grid of 128 blocks per CU × 256 threads; tables up to 64 MiB are written in a whole number of
+rounds per launch (about 16 accesses per thread), larger ones once per launch. In the cache runs
+the same element of `t` is therefore written several times per launch, always with the same value
+`b[k]`; concurrent writes of the same value are harmless.
+
+**Bytes.** Nominal: 8 B written to `t` + 8 B read from `b` + 4 B index per access. With one
+access per line (stride 128 B) every write touches its own cache line and writes only 8 B of it;
+what the hardware moves (partial-line writes, possibly read-for-ownership) shows in the counters.
+`d_gaccess_per_s` gives the accesses per second.
+
+**Verification.** `t` is initialised with -1, `b[k] = k`. After the timed loop the whole table is
+compared with the expected one: `t[idx[k]] == b[k]` for every `k`, and every other element still
+-1. This also detects writes to wrong positions.
 
 ## shared_read
 
