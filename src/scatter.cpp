@@ -2,23 +2,23 @@
 // benchmark=scatter
 // level=1
 // component=GPU/Memory/Bandwidth
-// description=Indirect write t[idx[k]] = b[k] (scatter), independent accesses; strided or random order of the cache lines; bandwidth of irregular writes per memory level
+// description=Indirect write t[idx[k]] = b[k] (scatter) of 16-byte elements, independent accesses; strided or random order of the cache lines; bandwidth of irregular writes per memory level
 // tags=memory-bound;bandwidth;irregular;write
-// version=0.1.0
+// version=0.2.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
 // param.pattern=random|strided, random|Order of the accesses: strided = lines in address order, random = lines in a random permutation (no duplicates)
 // param.working_set_bytes=1073741824|>= 2 x stride_bytes, <= 17179869184|Size of the table t; selects the memory level (L1, L2, LLC, HBM)
-// param.stride_bytes=128|multiple of 8|Distance between the written elements; 128 = one access per cache line
+// param.stride_bytes=128|multiple of 16|Distance between the written elements; 128 = one access per cache line
 //
 // # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
-// # expect_isa=global_store_dwordx2
+// # expect_isa=global_store_dwordx4
 // expect_counters=
 // ---- end metadata ----
 //
-// scatter: the threads read an input array b in order and write its elements to
+// scatter: the threads read an input array b in order and write its 16-byte elements to
 // the table t at the addresses given by an index array (t[idx[k]] = b[k]); the
 // accesses are independent of each other. Same index as gather: every stride-th
 // element of t once, in address order (strided) or in a random order (random).
@@ -54,14 +54,24 @@ static const int THREADS = 256;
 static const int BLOCKS_PER_CU = 128;                        // as in read / gather
 static const unsigned long long LLC_BYTES = 64ULL << 20;    // above: every element once per launch
 static const unsigned long long ACCESSES_PER_THREAD = 16;    // for tables up to LLC_BYTES
-static const double UNTOUCHED = -1.0;                       // initial value of t (checked after the run)
+static const unsigned ELEM_BYTES = 16;                       // sizeof(uint4), widest store per lane
+static const unsigned UNTOUCHED = 0xFFFFFFFFu;               // initial value of every word of t (checked after the run)
+
+// Value of input element k (also computed on the host for verification)
+__host__ __device__ inline uint4 value(unsigned long k) {
+    const unsigned lo = (unsigned)k, hi = (unsigned)(k >> 32);
+    return make_uint4(lo, hi, lo ^ 0xA5A5A5A5u, ~lo);
+}
+static bool same(const uint4& a, const uint4& b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z && a.w == b.w;
+}
 
 // Grid-stride loop over the accesses k = 0 .. m-1 of one launch; access k writes
 // b[k mod n] to t[idx[k mod n]]. b is read in order (coalesced), t is written
 // irregularly. The position in the index (k mod n) is advanced incrementally, so
 // no 64-bit division per access limits the throughput. In the cache runs the same
 // element of t is written several times per launch, always with the same value.
-__global__ void scatter(double* t, const unsigned int* idx, const double* b,
+__global__ void scatter(uint4* t, const unsigned int* idx, const uint4* b,
                         unsigned long n, unsigned long m) {
     const unsigned long tid = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;
     const unsigned long g = (unsigned long)gridDim.x * blockDim.x;
@@ -130,7 +140,7 @@ int main(int argc, char** argv) {
             valid = parse_ull(val, &ws) && ws > 0 && ws <= (1ULL << 34);
         } else if (!strcmp(key, "--stride_bytes")) {
             seen = &have_stride;
-            valid = parse_ull(val, &stride) && stride > 0 && stride % 8 == 0;
+            valid = parse_ull(val, &stride) && stride > 0 && stride % ELEM_BYTES == 0;
         } else {
             fprintf(stderr, "scatter: unknown option %s\n", key);
             return 1;
@@ -143,8 +153,8 @@ int main(int argc, char** argv) {
         }
     }
     if (!have_duration) { fprintf(stderr, "scatter: --duration is required\n"); return 1; }
-    const unsigned long long table_elems = ws / 8;
-    const unsigned long long stride_elems = stride / 8;
+    const unsigned long long table_elems = ws / ELEM_BYTES;
+    const unsigned long long stride_elems = stride / ELEM_BYTES;
     const unsigned long long n = table_elems / stride_elems;          // index length (lines visited)
     if (n < 2) { fprintf(stderr, "scatter: --working_set_bytes must be at least 2 x --stride_bytes\n"); return 1; }
     if (table_elems > 0xFFFFFFFFull) { fprintf(stderr, "scatter: table too large for 32-bit indices\n"); return 1; }
@@ -183,24 +193,25 @@ int main(int argc, char** argv) {
     }
     for (unsigned long long k = 0; k < n; ++k) h_idx[k] = (unsigned int)(h_idx[k] * stride_elems);
 
-    // Input b[k] = k (exact in double up to 2^53), so every value says where it came from.
-    std::vector<double> h_b(n);
-    for (unsigned long long k = 0; k < n; ++k) h_b[k] = (double)k;
+    // Input b[k] = value(k), so every value says where it came from.
+    std::vector<uint4> h_b(n);
+    for (unsigned long long k = 0; k < n; ++k) h_b[k] = value(k);
     // Table t starts with UNTOUCHED everywhere; elements between the strides stay so.
-    std::vector<double> h_t(table_elems, UNTOUCHED);
+    const uint4 untouched = make_uint4(UNTOUCHED, UNTOUCHED, UNTOUCHED, UNTOUCHED);
+    std::vector<uint4> h_t(table_elems, untouched);
 
-    double *d_t, *d_b;
+    uint4 *d_t, *d_b;
     unsigned int* d_idx;
-    HIP_CHECK(hipMalloc(&d_t, table_elems * sizeof(double)));
+    HIP_CHECK(hipMalloc(&d_t, table_elems * sizeof(uint4)));
     HIP_CHECK(hipMalloc(&d_idx, n * sizeof(unsigned int)));
-    HIP_CHECK(hipMalloc(&d_b, n * sizeof(double)));
-    HIP_CHECK(hipMemcpy(d_t, h_t.data(), table_elems * sizeof(double), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMalloc(&d_b, n * sizeof(uint4)));
+    HIP_CHECK(hipMemcpy(d_t, h_t.data(), table_elems * sizeof(uint4), hipMemcpyHostToDevice));
     HIP_CHECK(hipMemcpy(d_idx, h_idx.data(), n * sizeof(unsigned int), hipMemcpyHostToDevice));
-    HIP_CHECK(hipMemcpy(d_b, h_b.data(), n * sizeof(double), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_b, h_b.data(), n * sizeof(uint4), hipMemcpyHostToDevice));
 
     // Warmup (not part of the ROI)
     hipLaunchKernelGGL(scatter, dim3(blocks), dim3(THREADS), 0, 0,
-                       d_t, (const unsigned int*)d_idx, (const double*)d_b,
+                       d_t, (const unsigned int*)d_idx, (const uint4*)d_b,
                        (unsigned long)n, (unsigned long)m);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
@@ -213,7 +224,7 @@ int main(int argc, char** argv) {
     double elapsed;
     do {
         hipLaunchKernelGGL(scatter, dim3(blocks), dim3(THREADS), 0, 0,
-                           d_t, (const unsigned int*)d_idx, (const double*)d_b,
+                           d_t, (const unsigned int*)d_idx, (const uint4*)d_b,
                            (unsigned long)n, (unsigned long)m);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
@@ -224,22 +235,22 @@ int main(int argc, char** argv) {
     const unix_clock::time_point u1 = unix_clock::now();
 
     // ---- verification: t[idx[k]] == b[k] for every k, every other element untouched ----
-    std::vector<double> h_out(table_elems);
-    HIP_CHECK(hipMemcpy(h_out.data(), d_t, table_elems * sizeof(double), hipMemcpyDeviceToHost));
+    std::vector<uint4> h_out(table_elems);
+    HIP_CHECK(hipMemcpy(h_out.data(), d_t, table_elems * sizeof(uint4), hipMemcpyDeviceToHost));
     for (unsigned long long k = 0; k < n; ++k) h_t[h_idx[k]] = h_b[k];   // expected table
     bool ok = true;
     unsigned long long bad = 0;
     for (unsigned long long e = 0; e < table_elems; ++e)
-        if (h_out[e] != h_t[e]) { bad = e; ok = false; break; }
+        if (!same(h_out[e], h_t[e])) { bad = e; ok = false; break; }
     if (!ok)
-        fprintf(stderr, "scatter: verification failed at element %llu: got %g, expected %g\n",
-                bad, h_out[bad], h_t[bad]);
+        fprintf(stderr, "scatter: verification failed at element %llu: got %08x, expected %08x (first word)\n",
+                bad, h_out[bad].x, h_t[bad].x);
 
     // ---- results; GB = 10^9 byte ----
-    // Nominal bytes: per access 8 B written to t + 8 B read from b + 4 B index.
+    // Nominal bytes: per access 16 B written to t + 16 B read from b + 4 B index.
     // The hardware moves whole cache lines; the difference shows in the counters.
     const double accesses = (double)launches * m;
-    const double a_gbyte = accesses * 20.0 / 1e9;
+    const double a_gbyte = accesses * (2.0 * ELEM_BYTES + 4.0) / 1e9;
     const double a_gflop = 0.0;                            // no arithmetic
     const double a_intensity = a_gflop / a_gbyte;          // 0
 
@@ -251,7 +262,7 @@ int main(int argc, char** argv) {
            "\"e_pci_bus_id\": \"%s\", "
            "\"a_gflop\": %.9g, \"a_gbyte\": %.9g, \"a_intensity\": %.9g, "
            "\"d_gflop_per_s\": %.9g, \"d_gbyte_per_s\": %.9g, "
-           "\"verify_ok\": %s, \"precision\": \"fp64\", \"pattern\": \"%s\", "
+           "\"verify_ok\": %s, \"pattern\": \"%s\", "
            "\"d_gaccess_per_s\": %.9g, "
            "\"e_working_set_bytes\": %llu, \"e_stride_bytes\": %llu, \"e_accesses\": %llu, "
            "\"e_index_length\": %llu, \"e_blocks\": %u, \"e_threads\": %d}\n",

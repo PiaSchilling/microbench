@@ -156,7 +156,7 @@ the vector L1 (not the scalar cache).
 ## gather
 
 **Kernel.** Own implementation. The threads read elements of the table `t` at the addresses
-given by an index array, `t[idx[k]]` (fp64), and sum them; every thread stores its sum once
+given by an index array, `t[idx[k]]`, and sum them; every thread stores its sum once
 (contiguous). The accesses are independent of each other; this is the counterpart of `chase`,
 where every access depends on the previous one. Gather/scatter as an access type is standard
 (vector machines, HPC Challenge RandomAccess, Uwe Küster's loops); no code was taken over (the
@@ -178,15 +178,24 @@ incrementally, without a division per access). The memory level is selected by
   16 384 accesses, i.e. 64 blocks for 228 CUs (fixed in version 0.2.0);
 - larger tables (HBM): every element once per launch.
 
-**Bytes.** Nominal: 8 B table + 4 B index per access, plus 8 B result per thread and launch.
+**Element width.** 16-byte elements (`uint4`, expected `global_load_dwordx4`), the widest load per
+lane, as in all Level 1 memory benchmarks (`read`, `write`, `shared_read`): Level 1 drives the path
+to its maximum. For irregular accesses the limit is the number of requests (one cache line per
+access), not the data width; 16 B per request gives the most useful data at that request rate. The
+sums are integer adds (`a_gflop = 0`). Until version 0.2.0: 8-byte `double` elements (changed
+2026-11-23; the measurement of 18.11. used 0.2.0).
+
+**Bytes.** Nominal: 16 B table + 4 B index per access, plus 16 B result per thread and launch.
 The hardware moves whole cache lines; with one access per line (stride 128 B) and a table larger
-than the caches, the bytes moved from HBM are up to 16 times the nominal table bytes, for both
+than the caches, the bytes moved from HBM are up to 8 times the nominal table bytes, for both
 patterns. The difference between strided and
 random therefore comes from the order (DRAM page locality, prefetching), not from the amount. The counters show the difference (an example for the
 roofline question: nominal intensity and actual traffic diverge). The extra field
 `d_gaccess_per_s` gives the accesses per second (comparable to GUPS).
 
-**Verification.** The sums of a sample of 1000 threads are recomputed on the host.
+**Verification.** The sums of all threads are recomputed on the host (about as many additions as
+accesses per launch). A sample with a fixed step is not enough: with `g mod n = 0` every thread
+visits only one index position, so a sample can miss whole positions.
 
 **Related benchmarks (planned).** Level 1, each as its own small benchmark: `scatter`
 (irregular writes, built 2026-11-23) and `atomic` (atomic read-modify-write,
@@ -202,7 +211,8 @@ address-translation effects); the runs check this assumption.
 
 **Kernel.** Own implementation, the counterpart of `gather` (Uwe Küster's loop
 `a(index(i)) = b(i)`). The threads read an input array `b` in order (coalesced) and write each
-element to the table `t` at the address given by the index: `t[idx[k]] = b[k]` (fp64). The
+element to the table `t` at the address given by the index: `t[idx[k]] = b[k]` (16-byte `uint4`
+elements, the widest store per lane, see `gather`). The
 accesses are independent of each other; there is no arithmetic (`a_gflop = 0`).
 
 **Index, grid, memory level.** Exactly as in `gather`: the index visits every `stride`-th element
@@ -212,14 +222,15 @@ rounds per launch (about 16 accesses per thread), larger ones once per launch. I
 the same element of `t` is therefore written several times per launch, always with the same value
 `b[k]`; concurrent writes of the same value are harmless.
 
-**Bytes.** Nominal: 8 B written to `t` + 8 B read from `b` + 4 B index per access. With one
-access per line (stride 128 B) every write touches its own cache line and writes only 8 B of it;
+**Bytes.** Nominal: 16 B written to `t` + 16 B read from `b` + 4 B index per access. With one
+access per line (stride 128 B) every write touches its own cache line and writes only 16 B of it;
 what the hardware moves (partial-line writes, possibly read-for-ownership) shows in the counters.
 `d_gaccess_per_s` gives the accesses per second.
 
-**Verification.** `t` is initialised with -1, `b[k] = k`. After the timed loop the whole table is
+**Verification.** Every word of `t` is initialised with `0xFFFFFFFF`, `b[k]` holds a value derived
+from `k`. After the timed loop the whole table is
 compared with the expected one: `t[idx[k]] == b[k]` for every `k`, and every other element still
--1. This also detects writes to wrong positions.
+untouched. This also detects writes to wrong positions.
 
 ## shared_read
 
