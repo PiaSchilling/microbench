@@ -13,6 +13,8 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [reuse](#reuse) | 1 | L1, L2, LLC | read bandwidth per cache level |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
 | [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
+| [shared_read](#shared_read) | 1 | LDS | LDS read bandwidth |
+| [shared_read_rocprof](#shared_read_rocprof) | ref | LDS | reference only: rocprof-compute LDS kernel, for comparison with shared_read |
 | [gemm](#gemm) | 2 | VALU, LDS, memory | load shifted between memory and compute via K |
 
 ## fma
@@ -174,6 +176,56 @@ style XOR updates), `random_axpy`, several indirect streams.
 **Strided vs. random per level.** Both patterns run for L1, L2, LLC and HBM. Expected: a large
 difference in HBM (DRAM page locality, prefetching), a small one in the caches (at most
 address-translation effects); the runs check this assumption.
+
+## shared_read
+
+**Kernel.** Own implementation. Every block (256 threads) fills 16 KiB of LDS (`__shared__`,
+1024 elements of 16 B) once and then reads it in a loop: per iteration every thread makes four
+independent 16-byte reads (`uint4`, expected `ds_read_b128`) at constant offsets 0, 4, 8 and
+12 KiB from a start element `base`. Within a wavefront the 64 lanes read 64 consecutive
+16-byte elements, so the reads are free of bank conflicts. `base` moves by one wavefront
+(64 elements = 1 KiB) per iteration; without this shift the compiler could hoist the reads out
+of the loop. The values are summed with three-operand adds (expected `v_add3_u32`, two VALU
+instructions per read; the VALU therefore shows some load in the counters).
+
+**Grid.** Fixed grid as in `read` and `gather`: 128 blocks per CU × 256 threads. With 16 KiB per
+block, 4 blocks (16 wavefronts) fit on a CU at the same time (64 KiB LDS per CU).
+`--iterations` (default 1000) sets the launch length: per launch
+blocks × 256 × iterations × 4 × 16 B (≈ 0.48 TB on the MI300A, a few milliseconds).
+
+**Bytes.** `a_gbyte` / `d_gbyte_per_s` are LDS bytes, not memory traffic. Theoretical peak:
+128 B per clock and CU (32 banks × 4 B), ≈ 61 TB/s at 2100 MHz with 228 CUs; the log line gives
+the share of this value. The SoL counter formula in the counter wishlist uses the same peak.
+
+**Verification.** Block 0 writes the result of every thread; the host recomputes all 256 values
+(same fill pattern and arithmetic). All other blocks store only if their result equals a magic
+value, so the loop cannot be removed in any block.
+
+**Why not the rocprof-compute kernel.** See `shared_read_rocprof`: it reads single bytes in a dependent
+chain and therefore does not reach the LDS peak. It is kept as a reference run for comparison.
+
+## shared_read_rocprof
+
+**Reference only, not part of the coverage analysis.** The run in `runs.cfg` is named
+`ref_shared_read_rocprof`.
+
+**Kernel.** `LDS_bw`, taken unchanged (except `extern "C"`) from the roofline benchmark of
+rocprofiler-compute, github.com/ROCm/rocm-systems, branch develop, commit 6f44164,
+`projects/rocprofiler-compute/src/roofline/benchmark/benchmark_base.py`. Thread 0 fills 64 bytes
+of LDS as a chain (`shmem[i] = i+1`, `shmem[63] = 0`); every thread then follows
+`index = shmem[index]` for 2000 steps. Each read depends on the previous one, reads 1 byte
+(`ds_read_u8` expected) and is counted as 4 bytes (`sizeof(float)`) by rocprof-compute. Threads
+with `tid >= 64` start outside the 64-byte array (as in the original). Launch configuration as
+there: 256 threads, 128 blocks per CU, 2000 iterations.
+
+**What it measures.** Rather latency × parallelism of dependent LDS reads than bandwidth.
+`d_gbyte_per_s` follows the rocprof-compute counting (4 B per read) so the value can be compared
+with the LDS peak that rocprof-compute reports; `d_gbyte_per_s_actual` (1 B per read) and
+`d_gread_per_s` (reads per second) are given as well.
+
+**Changes for this suite.** Compiled ahead of time instead of hiprtc; time loop over
+`--duration` with ROI time stamps and JSON output; argument check; no verification
+(`verify_ok = null`). License: MIT (notice in the source file).
 
 ## gemm
 

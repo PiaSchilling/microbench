@@ -24,7 +24,7 @@
 // in a random order (random). Fixed grid (128 blocks per CU); small tables are read
 // many times per launch, large ones once. Measures the bandwidth of irregular
 // reads per memory level; the counterpart of chase (dependent accesses, latency).
-// Source: own implementation (gather as in the HPC Challenge / Uwe Kuester loops).
+// Source: own implementation (gather as in the HPC Challenge).
 // Details: docs/benchmarks.md#gather
 // Interface: docs/benchmark_contract.md
 
