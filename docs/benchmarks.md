@@ -17,6 +17,7 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
 | [scatter](#scatter) | 1 | L1, L2, LLC, HBM | bandwidth of irregular writes (strided, random) |
 | [shared_read](#shared_read) | 1 | LDS | LDS read bandwidth |
+| [shared_read_rocprof_prefill](#shared_read_rocprof_prefill) | test | LDS | test only: LDS_bw after filling the LDS with a pattern |
 | [shared_read_rocprof](#shared_read_rocprof) | ref | LDS | reference only: rocprof-compute LDS kernel, for comparison with shared_read |
 | [gemm](#gemm) | 2 | VALU, LDS, memory | load shifted between memory and compute via K |
 
@@ -293,6 +294,28 @@ value, so the loop cannot be removed in any block.
 
 **Why not the rocprof-compute kernel.** See `shared_read_rocprof`: it reads single bytes in a dependent
 chain and therefore does not reach the LDS peak. It is kept as a reference run for comparison.
+
+## shared_read_rocprof_prefill
+
+**Test only, not part of the coverage analysis.** Runs the unchanged `LDS_bw` kernel (see
+`shared_read_rocprof`) after a prefill kernel has written the whole LDS of every CU
+(`--prefill zero|random`, or `none` = no prefill). The threads 64–255 of `LDS_bw` start outside
+`shmem[64]` and read bytes the kernel never writes, so they read whatever earlier kernels left in
+the LDS.
+
+**Motivation (2026-11-24).** The LDS peak reported by rocprof-compute differs between runs: about
+57.5 TB/s in older roofline results, 53.2 TB/s in a recent run, 42.0 TB/s in a run together with
+`gemm` (which uses the LDS heavily). Hypothesis: the out-of-range reads make the result depend on
+leftover LDS contents (zeros → threads join the 64-byte chain, no bank conflicts; other data →
+random jumps, bank conflicts). If `zero` gives about the `--variant fixed` value and `random` a lower
+one, the AMD reference value is not reproducible.
+
+**Prefill kernel.** Own code: `16 × CUs` blocks of 256 threads, each with 64 KiB dynamic LDS (the
+whole LDS of a CU), write zeros or pseudo-random words and synchronise. It runs once before the
+warm-up; `LDS_bw` never writes the bytes in question, so the pattern stays for all launches.
+Whether reads beyond the workgroup's LDS allocation return the prefilled data or 0 depends on the
+hardware; if all three variants give the same result, the reads stay inside the allocation and are
+zero/garbage-independent.
 
 ## shared_read_rocprof
 
