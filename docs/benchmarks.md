@@ -8,6 +8,7 @@ benchmarks is described in `docs/benchmark_contract.md`.
 |---|---|---|---|
 | [fma](#fma) | 1 | VALU | peak vector throughput per precision |
 | [mfma](#mfma) | 1 | Matrix Cores | peak matrix throughput per precision |
+| [smfma](#smfma) | 1 | Matrix Cores (sparse) | peak sparse matrix throughput per precision |
 | [copy](#copy) | 1 | HBM | bandwidth (read + write) |
 | [read](#read) | 1 | HBM | read bandwidth |
 | [write](#write) | 1 | L2, LLC, HBM | write bandwidth |
@@ -76,6 +77,31 @@ internal precision, accumulation in fp32). A and B hold 2 floats per lane becaus
 ops_per_instruction = 2 × 32 × 32 × 4 = 8192. Expected peak: 4 × the fp32 matrix rate (AMD lists
 490.3 TFLOP/s tf32 matrix for the MI300A at 2100 MHz). Note: xf32 exists on gfx940–942 only; later
 architectures (gfx950) emulate tf32 in software.
+
+## smfma
+
+**Name.** AMD calls the instructions `v_smfmac` (sparse matrix fused multiply-accumulate); the
+benchmark is called `smfma` for consistency with `mfma`, since it does the same `D = A*B + C`.
+
+**Kernel.** Own implementation (rocprof-compute has no sparse kernel), same pattern and launch
+configuration as `mfma`: every wavefront runs one dependent chain `result = A*B + result` with
+constant operands, 256 threads per block, 128 blocks per CU, 2000 iterations. Instructions
+(`__builtin_amdgcn_smfmac_*`): fp16 `v_smfmac_f32_32x32x16_f16`, bf16 `v_smfmac_f32_32x32x16_bf16`,
+int8 `v_smfmac_i32_32x32x32_i8`, fp8 `v_smfmac_f32_32x32x32_fp8_fp8` (fnuz on gfx942).
+
+**Sparsity.** A is 2:4 structured sparse along K: of every 4 values 2 are zero. A stores only the 2
+non-zero values per group (half of K per lane), B all values; an index operand (2 bits per stored
+value) says where the stored values belong. The hardware skips the zeros, so one instruction covers
+twice the K of the dense instruction (32x32x16 f16 vs. 32x32x8). The index is the same constant for
+all groups and lanes (`0x44444444`: positions 0 and 1); any valid pattern costs the same.
+
+**FLOP.** Dense-equivalent, as in AMD's sparse peak figures: `2 * M * N * K` with the K of the
+instruction name (fp16/bf16: 32768, int8/fp8: 65536 per instruction). Expected: about 2 × the dense
+`mfma` rate of the same precision.
+
+**Local ISA check (2026-11-24).** The four kernels, rewritten in plain C with the same builtins and
+compiled with clang 18 for gfx942, emit the expected `v_smfmac_*` instructions in the loop (23 VGPRs,
+no scratch, occupancy 8 waves per SIMD). To be confirmed with hipcc on the node.
 
 ## copy
 
