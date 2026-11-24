@@ -312,6 +312,8 @@ the original also reads out of bounds (result depends on leftover LDS contents, 
 
 ## shared_read_rocprof_prefill
 
+*Source in `src/experimental/`, not built by default: move it to `src/` and uncomment its runs in `config/runs.cfg` to run it.*
+
 **Test only, not part of the coverage analysis.** Runs the unchanged `LDS_bw` kernel (see
 `shared_read_rocprof`) after a prefill kernel has written the whole LDS of every CU
 (`--prefill zero|random`, or `none` = no prefill). The threads 64–255 of `LDS_bw` start outside
@@ -333,6 +335,8 @@ hardware; if all three variants give the same result, the reads stay inside the 
 zero/garbage-independent.
 
 ## shared_read_rocprof
+
+*Source in `src/experimental/`, not built by default: move it to `src/` and uncomment its runs in `config/runs.cfg` to run it.*
 
 **Reference only, not part of the coverage analysis.** The run in `runs.cfg` is named
 `ref_shared_read_rocprof`.
