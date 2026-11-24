@@ -4,18 +4,19 @@
 // component=GPU/Compute/MFMA
 // description=Matrix-core (MFMA) kernel of the rocprof-compute roofline: one MFMA chain per wavefront with constant operands; compute pole of the matrix cores
 // tags=compute-bound;mfma;matrix-core
-// version=0.1.0
-// precisions=fp64,fp32,fp16,bf16,int8,fp8
+// version=0.2.0
+// precisions=fp64,fp32,tf32,fp16,bf16,int8,fp8
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
-// param.precision=fp64|see precisions|Input type of the MFMA instruction (fp16, bf16, fp8: accumulation in fp32; int8: in int32)
+// param.precision=fp64|see precisions|Input type of the MFMA instruction (tf32 = xf32 on gfx942; tf32, fp16, bf16, fp8: accumulation in fp32; int8: in int32)
 // param.iters=2000|>= 1|MFMA instructions per wavefront and launch (2000 as in rocprof-compute)
 //
 // # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa.fp64=v_mfma_f64_16x16x4_f64
 // # expect_isa.fp32=v_mfma_f32_32x32x2_f32
+// # expect_isa.tf32=v_mfma_f32_32x32x4_xf32
 // # expect_isa.fp16=v_mfma_f32_32x32x8_f16
 // # expect_isa.bf16=v_mfma_f32_32x32x8_bf16
 // # expect_isa.int8=v_mfma_i32_32x32x16_i8
@@ -26,7 +27,8 @@
 // mfma: every wavefront runs one dependent chain of matrix multiply-adds
 // (v_mfma_*) on the Matrix Cores. Measures peak Matrix Core throughput per
 // precision.
-// Source: mfma_* kernels of the rocprof-compute roofline (MIT, see below).
+// Source: mfma_* kernels of the rocprof-compute roofline (MIT, see below);
+// mfma_xf32 (tf32) is an own addition in the same pattern (rocprof-compute has none).
 // Details: docs/benchmarks.md#mfma
 // Interface: docs/benchmark_contract.md
 //
@@ -98,6 +100,30 @@ __global__ void mfma_f32(int iter, float *dummy)
     for(int i = 0; i < iter; ++i)
     {
         result = __builtin_amdgcn_mfma_f32_32x32x2f32(
+            a, a, result, 0, 0, 0);
+    }
+
+    if (result[0] != 2*result[0])
+    {
+        dummy[0] = result[0];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Own addition (not from rocprof-compute): tf32 matrix multiply. On gfx942 the
+// format is called xf32: fp32 inputs, internally reduced precision (19 bits),
+// accumulation in fp32. Same pattern as mfma_f32 above; A and B are 2 floats per
+// lane because K = 4 (instead of 2 for v_mfma_f32_32x32x2_f32).
+// ---------------------------------------------------------------------------
+__global__ void mfma_xf32(int iter, float *dummy)
+{
+    vec2<float> a;
+    a[1] = a[0] = threadIdx.x;
+    vec16<float> result = {0};
+
+    for(int i = 0; i < iter; ++i)
+    {
+        result = __builtin_amdgcn_mfma_f32_32x32x4_xf32(
             a, a, result, 0, 0, 0);
     }
 
@@ -211,6 +237,7 @@ struct MfmaType {
 static const MfmaType MFMA_TYPES[] = {
     {"fp64", mfma_f64,  "v_mfma_f64_16x16x4_f64",      2048},   // 2*16*16*4
     {"fp32", mfma_f32,  "v_mfma_f32_32x32x2_f32",      4096},   // 2*32*32*2
+    {"tf32", mfma_xf32, "v_mfma_f32_32x32x4_xf32",     8192},   // 2*32*32*4 (own addition)
     {"fp16", mfma_f16,  "v_mfma_f32_32x32x8_f16",     16384},   // 2*32*32*8
     {"bf16", mfma_bf16, "v_mfma_f32_32x32x8_bf16",    16384},   // 2*32*32*8
     {"int8", mfma_i8,   "v_mfma_i32_32x32x16_i8",     32768},   // 2*32*32*16
@@ -290,7 +317,7 @@ int main(int argc, char** argv) {
     for (const MfmaType& t : MFMA_TYPES)
         if (!strcmp(precision, t.precision)) type = &t;
     if (!type) {
-        fprintf(stderr, "mfma: --precision '%s' is not valid (fp64, fp32, fp16, bf16, int8, fp8)\n", precision);
+        fprintf(stderr, "mfma: --precision '%s' is not valid (fp64, fp32, tf32, fp16, bf16, int8, fp8)\n", precision);
         return 1;
     }
     if (check) return 0;                       // arguments valid, no GPU access

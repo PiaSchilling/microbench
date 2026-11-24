@@ -69,6 +69,14 @@ no verification (the store only prevents dead-code elimination; `verify_ok = nul
 gfx942 is the "fnuz" variant (AMD comment in `benchmark_gfx942.py`). License: MIT (notice in
 the source file).
 
+**tf32 (own addition, version 0.2.0).** rocprof-compute has no tf32 kernel. `mfma_xf32` follows the
+same pattern as `mfma_f32` with `__builtin_amdgcn_mfma_f32_32x32x4_xf32` (expected
+`v_mfma_f32_32x32x4_xf32`): on gfx942 the tf32 format is called xf32 (fp32 inputs with reduced
+internal precision, accumulation in fp32). A and B hold 2 floats per lane because K = 4;
+ops_per_instruction = 2 × 32 × 32 × 4 = 8192. Expected peak: 4 × the fp32 matrix rate (AMD lists
+490.3 TFLOP/s tf32 matrix for the MI300A at 2100 MHz). Note: xf32 exists on gfx940–942 only; later
+architectures (gfx950) emulate tf32 in software.
+
 ## copy
 
 **Kernel.** Copy kernel of STREAM (McCalpin) / BabelStream: one thread per element copies A to
