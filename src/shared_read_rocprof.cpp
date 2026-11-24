@@ -4,12 +4,13 @@
 // component=GPU/Memory/LDS
 // description=REFERENCE ONLY: LDS kernel of the rocprof-compute roofline (LDS_bw), dependent 1-byte reads (pointer chase in 64 B of LDS); bandwidth as counted by rocprof-compute (4 B per read); comparison for shared_read, not a coverage point
 // tags=lds;reference
-// version=0.1.0
+// version=0.2.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
 // param.iterations=2000|>= 1|Chase steps per thread and launch (2000 as in rocprof-compute)
+// param.variant=original|original, fixed|original = LDS_bw unchanged (threads 64-255 start outside the 64-byte array); fixed = same kernel with start index tid % 64 (only change)
 //
 // # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=ds_read_u8
@@ -105,6 +106,36 @@ __global__ void LDS_bw(int numIter, float *dummy)
 }
 
 // ---------------------------------------------------------------------------
+// Corrected variant (own change, not from rocprof-compute): identical to LDS_bw
+// except that the start index is tid % 64, so no thread reads outside shmem[64].
+// Comparing both variants shows whether the out-of-range reads change the result.
+// ---------------------------------------------------------------------------
+
+__global__ void LDS_bw_fixed(int numIter, float *dummy)
+{
+    const int tid = threadIdx.x;
+    __shared__ unsigned char shmem[64];
+
+    if (tid == 0)
+    {
+        #pragma unroll
+        for (int i=0;i<63;i++)
+            shmem[i] = i+1;
+
+        shmem[63] = 0;
+    }
+
+    __syncthreads();
+
+    int index = tid % 64;                       // only change: stay inside the array
+    #pragma unroll 64
+    for(int iter = 0; iter < numIter; iter++)
+        index = shmem[index];
+
+    dummy[tid] = (float )index;
+}
+
+// ---------------------------------------------------------------------------
 // Host
 // ---------------------------------------------------------------------------
 
@@ -140,7 +171,8 @@ static bool parse_ull(const char* s, unsigned long long* out) {
 int main(int argc, char** argv) {
     double duration = 0;
     unsigned long long iters_arg = 2000;
-    bool check = false, have_duration = false, have_iters = false;
+    const char* variant = "original";
+    bool check = false, have_duration = false, have_iters = false, have_variant = false;
 
     // ---- arguments (contract section 4) ----
     for (int i = 1; i < argc; ++i) {
@@ -156,6 +188,10 @@ int main(int argc, char** argv) {
         } else if (!strcmp(key, "--iterations")) {
             seen = &have_iters;
             valid = parse_ull(val, &iters_arg) && iters_arg >= 1 && iters_arg <= 1000000000ULL;
+        } else if (!strcmp(key, "--variant")) {
+            seen = &have_variant;
+            valid = !strcmp(val, "original") || !strcmp(val, "fixed");
+            variant = val;
         } else {
             fprintf(stderr, "shared_read_rocprof: unknown option %s\n", key);
             return 1;
@@ -170,6 +206,7 @@ int main(int argc, char** argv) {
     if (!have_duration) { fprintf(stderr, "shared_read_rocprof: --duration is required\n"); return 1; }
     if (check) return 0;                       // arguments valid, no GPU access
     const int iters = (int)iters_arg;
+    const bool fixed = !strcmp(variant, "fixed");
 
     // ---- setup (sizes as in rocprof-compute lds_bw_benchmark) ----
     hipDeviceProp_t prop;
@@ -179,14 +216,15 @@ int main(int argc, char** argv) {
              (unsigned)prop.pciDomainID, (unsigned)prop.pciBusID, (unsigned)prop.pciDeviceID);
     const unsigned blocks = BLOCKS_PER_CU * (unsigned)prop.multiProcessorCount;
     const double reads_per_launch = (double)blocks * WORKGROUP_SIZE * iters;
-    fprintf(stderr, "shared_read_rocprof: device %s (%s), blocks=%u threads=%d iterations=%d\n",
-            prop.name, pci, blocks, WORKGROUP_SIZE, iters);
+    fprintf(stderr, "shared_read_rocprof: device %s (%s), variant=%s blocks=%u threads=%d iterations=%d\n",
+            prop.name, pci, variant, blocks, WORKGROUP_SIZE, iters);
 
     float* d_dummy;
     HIP_CHECK(hipMalloc(&d_dummy, WORKGROUP_SIZE * sizeof(float)));
 
     // Warmup (not part of the ROI)
-    hipLaunchKernelGGL(LDS_bw, dim3(blocks), dim3(WORKGROUP_SIZE), 0, 0, iters, d_dummy);
+    if (fixed) hipLaunchKernelGGL(LDS_bw_fixed, dim3(blocks), dim3(WORKGROUP_SIZE), 0, 0, iters, d_dummy);
+    else       hipLaunchKernelGGL(LDS_bw, dim3(blocks), dim3(WORKGROUP_SIZE), 0, 0, iters, d_dummy);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -197,7 +235,8 @@ int main(int argc, char** argv) {
     mono_clock::time_point t1;
     double elapsed;
     do {
-        hipLaunchKernelGGL(LDS_bw, dim3(blocks), dim3(WORKGROUP_SIZE), 0, 0, iters, d_dummy);
+        if (fixed) hipLaunchKernelGGL(LDS_bw_fixed, dim3(blocks), dim3(WORKGROUP_SIZE), 0, 0, iters, d_dummy);
+        else       hipLaunchKernelGGL(LDS_bw, dim3(blocks), dim3(WORKGROUP_SIZE), 0, 0, iters, d_dummy);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
         ++launches;
@@ -222,12 +261,12 @@ int main(int argc, char** argv) {
            "\"e_pci_bus_id\": \"%s\", "
            "\"a_gflop\": %.9g, \"a_gbyte\": %.9g, \"a_intensity\": %.9g, "
            "\"d_gflop_per_s\": %.9g, \"d_gbyte_per_s\": %.9g, "
-           "\"verify_ok\": null, "
+           "\"verify_ok\": null, \"variant\": \"%s\", "
            "\"d_gbyte_per_s_actual\": %.9g, \"d_gread_per_s\": %.9g, "
            "\"e_loop_iterations\": %d, \"e_blocks\": %u, \"e_threads\": %d}\n",
            elapsed, launches, unix_s(u0), unix_s(u1), mono_ns(t0), mono_ns(t1), pci,
            a_gflop, a_gbyte, a_intensity, a_gflop / elapsed, a_gbyte / elapsed,
-           reads / elapsed / 1e9, reads / elapsed / 1e9,
+           variant, reads / elapsed / 1e9, reads / elapsed / 1e9,
            iters, blocks, WORKGROUP_SIZE);
     fflush(stdout);
 

@@ -283,6 +283,16 @@ with the LDS peak that rocprof-compute reports; `d_gbyte_per_s_actual` (1 B per 
 `--duration` with ROI time stamps and JSON output; argument check; no verification
 (`verify_ok = null`). License: MIT (notice in the source file).
 
+**Out-of-range reads and `--variant`.** `shmem` has 64 entries, but with 256 threads per block the
+start index `index = tid` reaches 255: threads 64–255 read outside the array (undefined behaviour in
+C++). On the hardware they read whatever lies beyond the array in the block's LDS allocation (or 0),
+so their chain is undefined and may cause bank conflicts that depend on leftover LDS contents.
+`--variant fixed` (own change, version 0.2.0) runs the same kernel with `index = tid % 64` as the only
+difference; the run `ref_shared_read_rocprof_fixed` compares both. Same result: the bug exists but does
+not change the number. Different result: the AMD reference value is distorted by the bug. The byte
+counting (4 B counted per 1-byte read) is a separate, questionable but explainable choice (one 4-byte
+bank slot per access, as in the rocprof-compute counter formula), not a bug.
+
 ## gemm
 
 **Kernel.** Matrix multiplication `C = A * B` on the VALU (no Matrix Cores), blocked or naive.
