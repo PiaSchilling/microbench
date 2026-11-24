@@ -276,8 +276,20 @@ independent 16-byte reads (`uint4`, expected `ds_read_b128`) at constant offsets
 12 KiB from a start element `base`. Within a wavefront the 64 lanes read 64 consecutive
 16-byte elements, so the reads are free of bank conflicts. `base` moves by one wavefront
 (64 elements = 1 KiB) per iteration; without this shift the compiler could hoist the reads out
-of the loop. The values are summed with three-operand adds (expected `v_add3_u32`, two VALU
-instructions per read; the VALU therefore shows some load in the counters).
+of the loop.
+
+**`--consume asm|sum`** (since 0.2.0). How the loaded values are used, so that the compiler
+cannot remove the reads:
+- `asm` (default): the 16 registers of an iteration feed an empty `asm volatile` statement.
+  The compiler must perform every read in every iteration but emits no instruction for the use,
+  so the VALU stays close to 0 and the run is a pure LDS point.
+- `sum`: the values are summed with three-operand adds (expected `v_add3_u32`, two VALU
+  instructions per read; measured VALU ≈ 40 %), as in version 0.1.0. Run `test_shared_read_sum`;
+  compared with `asm` it separates the power of the VALU from that of the LDS reads.
+
+Why not a dependent chain like `shared_read_rocprof` (`index = buf[index]`), only with 16 B: then
+every wavefront has only one read in flight, and whether the LDS is saturated depends on the
+latency and the occupancy; that is the principle of `chase`, not of a bandwidth benchmark.
 
 **Grid.** Fixed grid as in `read` and `gather`: 128 blocks per CU × 256 threads. With 16 KiB per
 block, 4 blocks (16 wavefronts) fit on a CU at the same time (64 KiB LDS per CU).
@@ -289,11 +301,14 @@ blocks × 256 × iterations × 4 × 16 B (≈ 0.48 TB on the MI300A, a few milli
 the share of this value. The SoL counter formula in the counter wishlist uses the same peak.
 
 **Verification.** Block 0 writes the result of every thread; the host recomputes all 256 values
-(same fill pattern and arithmetic). All other blocks store only if their result equals a magic
+(same fill pattern and arithmetic; for `asm` the XOR of the 16 words of the last iteration,
+for `sum` the XOR of the four sums). All other blocks store only if their result equals a magic
 value, so the loop cannot be removed in any block.
 
 **Why not the rocprof-compute kernel.** See `shared_read_rocprof`: it reads single bytes in a dependent
-chain and therefore does not reach the LDS peak. It is kept as a reference run for comparison.
+chain and counts 4 B per read, so it measures the LDS access rate rather than the data bandwidth;
+the original also reads out of bounds (result depends on leftover LDS contents, see
+`shared_read_rocprof_prefill`). It is kept as a reference run for comparison.
 
 ## shared_read_rocprof_prefill
 

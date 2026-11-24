@@ -4,12 +4,13 @@
 // component=GPU/Memory/LDS
 // description=Independent 16-byte reads from the LDS (ds_read_b128), consecutive addresses per wavefront, no bank conflicts; LDS read bandwidth
 // tags=lds;bandwidth;read-only
-// version=0.1.0
+// version=0.2.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
 // param.iterations=1000|>= 1|Loop iterations per thread and launch (4 reads of 16 B each); controls the launch length
+// param.consume=asm|asm, sum|How the loaded values are used: asm = empty inline asm marks them as used (almost no VALU), sum = summed with v_add3_u32 (VALU about 40 %)
 //
 // # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=ds_read_b128
@@ -21,6 +22,9 @@
 // consecutive 16-byte elements (no bank conflicts), and the start address moves
 // by one wavefront (1 KiB) per iteration so the loads cannot be hoisted. Measures
 // the LDS read bandwidth; theoretical peak 128 B per clock and CU.
+// --consume asm (default): the loaded values only feed an empty inline asm statement,
+// so the reads stay in the loop without arithmetic (VALU close to 0). --consume sum:
+// the values are summed (VALU about 40 %), the variant of version 0.1.0.
 // Source: own implementation. Reference for comparison: shared_read_rocprof.
 // Details: docs/benchmarks.md#shared_read
 // Interface: docs/benchmark_contract.md
@@ -60,6 +64,7 @@ __host__ __device__ inline unsigned fill(unsigned j, unsigned c) {
 // Kernel
 // ---------------------------------------------------------------------------
 
+template <bool SUM>
 __global__ void lds_read(unsigned* out, int iters)
 {
     __shared__ uint4 buf[ELEMS];
@@ -73,22 +78,38 @@ __global__ void lds_read(unsigned* out, int iters)
     __syncthreads();
 
     uint4 v = make_uint4(0, 0, 0, 0);
+    uint4 a = v, b = v, c = v, d = v;
     #pragma unroll 1
     for (int it = 0; it < iters; ++it) {
         // base in [0, 256): the four reads of an iteration are at constant offsets
         // (0, 4, 8, 12 KiB) from it; a wavefront reads 64 consecutive elements.
         const unsigned base = (tid + (unsigned)it * SHIFT) & (THREADS - 1);
-        const uint4 a = buf[base];
-        const uint4 b = buf[base + THREADS];
-        const uint4 c = buf[base + 2 * THREADS];
-        const uint4 d = buf[base + 3 * THREADS];
-        // three-operand adds (v_add3_u32): 2 VALU instructions per 16-byte read
-        v.x += a.x + b.x;  v.x += c.x + d.x;
-        v.y += a.y + b.y;  v.y += c.y + d.y;
-        v.z += a.z + b.z;  v.z += c.z + d.z;
-        v.w += a.w + b.w;  v.w += c.w + d.w;
+        a = buf[base];
+        b = buf[base + THREADS];
+        c = buf[base + 2 * THREADS];
+        d = buf[base + 3 * THREADS];
+        if (SUM) {
+            // three-operand adds (v_add3_u32): 2 VALU instructions per 16-byte read
+            v.x += a.x + b.x;  v.x += c.x + d.x;
+            v.y += a.y + b.y;  v.y += c.y + d.y;
+            v.z += a.z + b.z;  v.z += c.z + d.z;
+            v.w += a.w + b.w;  v.w += c.w + d.w;
+        } else {
+            // empty asm that "uses" all 16 registers: the compiler must keep every
+            // read in every iteration but emits no instruction for the use.
+            // "v" = VGPR constraint, only valid in the device compilation.
+#if defined(__HIP_DEVICE_COMPILE__)
+            asm volatile("" :: "v"(a.x), "v"(a.y), "v"(a.z), "v"(a.w),
+                               "v"(b.x), "v"(b.y), "v"(b.z), "v"(b.w),
+                               "v"(c.x), "v"(c.y), "v"(c.z), "v"(c.w),
+                               "v"(d.x), "v"(d.y), "v"(d.z), "v"(d.w));
+#endif
+        }
     }
-    const unsigned r = v.x ^ v.y ^ v.z ^ v.w;
+    // sum: the accumulated values; asm: the values of the last iteration
+    const unsigned r = SUM ? (v.x ^ v.y ^ v.z ^ v.w)
+                           : (a.x ^ a.y ^ a.z ^ a.w ^ b.x ^ b.y ^ b.z ^ b.w ^
+                              c.x ^ c.y ^ c.z ^ c.w ^ d.x ^ d.y ^ d.z ^ d.w);
     // Block 0 writes its results for the verification; all other blocks only
     // store if the result equals MAGIC, so the loop is needed in every block.
     if (blockIdx.x == 0) out[tid] = r;
@@ -96,7 +117,14 @@ __global__ void lds_read(unsigned* out, int iters)
 }
 
 // Host reference of r for thread tid (same arithmetic, unsigned wrap-around)
-static unsigned reference(unsigned tid, int iters) {
+static unsigned reference(unsigned tid, int iters, bool sum) {
+    if (!sum) {                     // asm: xor of the 16 words read in the last iteration
+        const unsigned base = (tid + (unsigned)(iters - 1) * SHIFT) & (THREADS - 1);
+        unsigned r = 0;
+        for (int s = 0; s < SLICES; ++s)
+            for (unsigned c = 0; c < 4; ++c) r ^= fill(base + s * THREADS, c);
+        return r;
+    }
     unsigned v[4] = {0, 0, 0, 0};
     for (int it = 0; it < iters; ++it) {
         const unsigned base = (tid + (unsigned)it * SHIFT) & (THREADS - 1);
@@ -142,7 +170,8 @@ static bool parse_ull(const char* s, unsigned long long* out) {
 int main(int argc, char** argv) {
     double duration = 0;
     unsigned long long iters_arg = 1000;
-    bool check = false, have_duration = false, have_iters = false;
+    bool check = false, have_duration = false, have_iters = false, have_consume = false;
+    bool sum = false;                          // --consume asm (default)
 
     // ---- arguments (contract section 4) ----
     for (int i = 1; i < argc; ++i) {
@@ -158,6 +187,10 @@ int main(int argc, char** argv) {
         } else if (!strcmp(key, "--iterations")) {
             seen = &have_iters;
             valid = parse_ull(val, &iters_arg) && iters_arg >= 1 && iters_arg <= 1000000000ULL;
+        } else if (!strcmp(key, "--consume")) {
+            seen = &have_consume;
+            valid = !strcmp(val, "asm") || !strcmp(val, "sum");
+            sum = !strcmp(val, "sum");
         } else {
             fprintf(stderr, "shared_read: unknown option %s\n", key);
             return 1;
@@ -183,15 +216,16 @@ int main(int argc, char** argv) {
     const unsigned blocks = BLOCKS_PER_CU * cus;
     // LDS bytes read per launch: blocks x threads x iterations x 4 reads x 16 B
     const double bytes_per_launch = (double)blocks * THREADS * iters * SLICES * 16.0;
-    fprintf(stderr, "shared_read: device %s (%s), blocks=%u threads=%d iterations=%d lds_per_block=%d B, %.3f GB per launch\n",
-            prop.name, pci, blocks, THREADS, iters, ELEMS * 16, bytes_per_launch / 1e9);
+    fprintf(stderr, "shared_read: device %s (%s), consume=%s blocks=%u threads=%d iterations=%d lds_per_block=%d B, %.3f GB per launch\n",
+            prop.name, pci, sum ? "sum" : "asm", blocks, THREADS, iters, ELEMS * 16, bytes_per_launch / 1e9);
 
     unsigned* d_out;
     HIP_CHECK(hipMalloc(&d_out, (THREADS + 1) * sizeof(unsigned)));
     HIP_CHECK(hipMemset(d_out, 0, (THREADS + 1) * sizeof(unsigned)));
 
     // Warmup (not part of the ROI)
-    hipLaunchKernelGGL(lds_read, dim3(blocks), dim3(THREADS), 0, 0, d_out, iters);
+    if (sum) hipLaunchKernelGGL(lds_read<true>, dim3(blocks), dim3(THREADS), 0, 0, d_out, iters);
+    else     hipLaunchKernelGGL(lds_read<false>, dim3(blocks), dim3(THREADS), 0, 0, d_out, iters);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -202,7 +236,8 @@ int main(int argc, char** argv) {
     mono_clock::time_point t1;
     double elapsed;
     do {
-        hipLaunchKernelGGL(lds_read, dim3(blocks), dim3(THREADS), 0, 0, d_out, iters);
+        if (sum) hipLaunchKernelGGL(lds_read<true>, dim3(blocks), dim3(THREADS), 0, 0, d_out, iters);
+        else     hipLaunchKernelGGL(lds_read<false>, dim3(blocks), dim3(THREADS), 0, 0, d_out, iters);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
         ++launches;
@@ -215,11 +250,11 @@ int main(int argc, char** argv) {
     std::vector<unsigned> h_out(THREADS);
     HIP_CHECK(hipMemcpy(h_out.data(), d_out, THREADS * sizeof(unsigned), hipMemcpyDeviceToHost));
     bool ok = true;
-    for (unsigned t = 0; t < (unsigned)THREADS && ok; ++t) ok = (h_out[t] == reference(t, iters));
+    for (unsigned t = 0; t < (unsigned)THREADS && ok; ++t) ok = (h_out[t] == reference(t, iters, sum));
 
     // ---- results; GB = 10^9 byte. Bytes are LDS bytes (no HBM traffic) ----
     const double a_gbyte = (double)launches * bytes_per_launch / 1e9;
-    const double a_gflop = 0.0;                     // integer adds only
+    const double a_gflop = 0.0;                     // integer adds only (sum) or none (asm)
     const double a_intensity = a_gflop / a_gbyte;   // 0
     // Theoretical peak at the measured clock is not known here; at 2100 MHz:
     // 128 B x CUs x 2.1 GHz (for comparison in the log only)
@@ -234,11 +269,11 @@ int main(int argc, char** argv) {
            "\"e_pci_bus_id\": \"%s\", "
            "\"a_gflop\": %.9g, \"a_gbyte\": %.9g, \"a_intensity\": %.9g, "
            "\"d_gflop_per_s\": %.9g, \"d_gbyte_per_s\": %.9g, "
-           "\"verify_ok\": %s, "
+           "\"verify_ok\": %s, \"consume\": \"%s\", "
            "\"e_lds_bytes_per_block\": %d, \"e_loop_iterations\": %d, \"e_blocks\": %u, \"e_threads\": %d}\n",
            elapsed, launches, unix_s(u0), unix_s(u1), mono_ns(t0), mono_ns(t1), pci,
            a_gflop, a_gbyte, a_intensity, a_gflop / elapsed, a_gbyte / elapsed,
-           ok ? "true" : "false", ELEMS * 16, iters, blocks, THREADS);
+           ok ? "true" : "false", sum ? "sum" : "asm", ELEMS * 16, iters, blocks, THREADS);
     fflush(stdout);
 
     HIP_CHECK(hipFree(d_out));
