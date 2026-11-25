@@ -13,6 +13,7 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [read](#read) | 1 | HBM | read bandwidth |
 | [write](#write) | 1 | L2, LLC, HBM | write bandwidth |
 | [reuse](#reuse) | 1 | L1, L2, LLC | read bandwidth per cache level |
+| [cached_read](#cached_read) | 1 | L1, L2, LLC | read bandwidth per cache level (own kernel, 16-byte loads, no arithmetic) |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
 | [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
 | [scatter](#scatter) | 1 | L1, L2, LLC, HBM | bandwidth of irregular writes (strided, random) |
@@ -175,6 +176,32 @@ own L2; the write-back at the end of each launch is small compared with the byte
 
 **Verification.** Every element holds a value derived from its position (`value(e)`); after the
 timed loop the whole buffer is compared on the host.
+
+## cached_read
+
+**Kernel.** Own implementation, read counterpart of `write` and `copy` for the cache levels. All
+blocks read the same buffer of `--working_set_bytes` (a power of two) with 16-byte loads (`uint4`,
+expected `global_load_dwordx4`). Per iteration every thread makes four independent reads at
+constant offsets of a quarter buffer from a start element; within a wavefront the 64 lanes read 64
+consecutive elements (coalesced). The start element moves by one wavefront (1 KiB) per iteration,
+computed with a bit mask instead of a modulo. Addresses are 32-bit byte offsets from four base
+pointers, so the compiler uses loads with a scalar base and a 32-bit vector offset: 2 VALU
+instructions per 4 loads (local clang check). The loaded values only feed an empty `asm volatile`
+statement (as `shared_read --consume asm`): the compiler must perform every read, but no arithmetic
+follows.
+
+**Why not `reuse`.** `reuse` (rocprof-compute) computes a modulo index for every 4-byte load and is
+therefore VALU-bound for the L1 (VALU 97 %, L1 axis 34 %; AMD's own comment notes the cost);
+see validation finding 15.
+
+**Grid and levels.** Fixed grid (128 blocks per CU × 256 threads), `--iterations` (default 1000)
+sets the launch length (blocks × 256 × iterations × 4 × 16 B per launch). Runs: `cached_read_l1`
+16 KiB (L1: 32 KiB per CU), `cached_read_l2` 2 MiB (L2: 4 MiB per XCD), `cached_read_llc` 64 MiB
+(Infinity Cache). HBM reads: `read`.
+
+**Verification.** The buffer is filled with `value(e)` by a setup kernel. Block 0 writes per thread
+the XOR of the 16 words of the last iteration, the host recomputes it; all other blocks store only
+if their result equals a magic value, so the loop cannot be removed in any block.
 
 ## reuse
 
