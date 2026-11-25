@@ -125,6 +125,12 @@ wrap-around. No L1 run: the L1 is assumed write-through (to be checked, measurem
 configurable); the cache-level runs deliberately break the STREAM rule that the arrays must be
 much larger than all caches.
 
+**Address arithmetic (since 0.5.0).** The position is a 32-bit byte offset from the array base
+pointers, so the compiler uses loads and stores with a scalar base and a 32-bit vector offset:
+6 VALU instructions per copy (offset update, wrap-around, loop counter) instead of about 11 with
+64-bit indices in 0.4.0 (local clang check), where `copy_l2` showed 21 % VALU although copy
+computes nothing. Limit: at most 2 GiB per array (`--working_set_bytes` ≤ 4 GiB).
+
 **Bytes.** 16 B read + 16 B written per copy (`a_gbyte`).
 
 **Verification.** A is filled with `value(e)` by a setup kernel, B with zeros; after the timed loop
@@ -133,7 +139,7 @@ every element of B is compared with `value(e)`.
 **History.** Named `stream` until 2026-11-10; renamed because it is only the Copy kernel of
 STREAM, not the full benchmark with Copy, Scale, Add and Triad. 0.4.0 (2026-11-25): `uint4`
 elements, fixed grid with grid-stride loop and repetitions per launch, `--working_set_bytes`
-instead of `--elements`, runs for L2 and LLC, full verification. Up to 0.3.0: one `double` per
+instead of `--elements`, runs for L2 and LLC, full verification. 0.5.0 (2026-11-25): 32-bit byte offsets instead of 64-bit indices. Up to 0.3.0: one `double` per
 thread, 100 launches per synchronization, HBM only (copy_hbm 3.76 TB/s, 2 GiB).
 
 ## read

@@ -4,12 +4,12 @@
 // component=GPU/Memory/Bandwidth
 // description=Copy kernel B[e] = A[e] with 16-byte elements in a grid-stride loop, consecutive addresses per wavefront (coalesced), as the Copy kernel of STREAM (McCalpin) / BabelStream; read + write bandwidth per memory level
 // tags=memory-bound;bandwidth;read-write
-// version=0.4.0
+// version=0.5.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
-// param.working_set_bytes=4294967296|multiple of 32, >= 32768, <= 68719476736|Size of both arrays together (A and B, half each); selects the memory level (L2, LLC, HBM)
+// param.working_set_bytes=4294967296|multiple of 32, >= 32768, <= 4294967296|Size of both arrays together (A and B, half each); selects the memory level (L2, LLC, HBM)
 //
 // # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=global_load_dwordx4;global_store_dwordx4
@@ -21,6 +21,10 @@
 // computation. Fixed grid (128 blocks per CU); working sets up to 64 MiB are copied
 // several times per launch (about 16 copies per thread), larger ones once, as in
 // write. Same access pattern for read and write, so it is a Level 1 benchmark.
+// Addresses are 32-bit byte offsets from the array base pointers (since 0.5.0):
+// the compiler then uses loads/stores with a scalar base and a 32-bit vector
+// offset instead of 64-bit address arithmetic (less VALU load); hence at most
+// 2 GiB per array.
 // Source: Copy kernel of STREAM (McCalpin) / BabelStream; grid and repetition
 // scheme own (as in write).
 // Details: docs/benchmarks.md#copy
@@ -65,18 +69,21 @@ __global__ void fill_kernel(uint4* a, unsigned long n) {
 }
 
 // Grid-stride loop over the copies k = 0 .. m-1 of one launch; copy k copies
-// element k mod n. The position (k mod n) is advanced incrementally, so no 64-bit
-// division per copy limits the throughput (as in write). In the cache runs the same
-// element is copied several times per launch.
-__global__ void copy_kernel(const uint4* a, uint4* b, unsigned long n, unsigned long m) {
-    const unsigned long tid = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned long g = (unsigned long)gridDim.x * blockDim.x;
-    const unsigned long g_mod = g % n;
-    unsigned long pos = tid % n;
-    for (unsigned long k = tid; k < m; k += g) {
-        b[pos] = a[pos];
-        pos += g_mod;
-        if (pos >= n) pos -= n;
+// element k mod n. The position is kept as a 32-bit byte offset (k mod n) * 16 and
+// advanced incrementally, so neither a division nor 64-bit address arithmetic is
+// needed per copy. In the cache runs the same element is copied several times
+// per launch (reuse within the kernel is what keeps the arrays in the cache).
+__global__ void copy_kernel(const uint4* a, uint4* b, unsigned nbytes, unsigned m) {
+    const unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned g = gridDim.x * blockDim.x;
+    const unsigned g_mod = (unsigned)(((unsigned long long)g * ELEM_BYTES) % nbytes);
+    unsigned off = (unsigned)(((unsigned long long)tid * ELEM_BYTES) % nbytes);
+    const char* pa = (const char*)a;
+    char* pb = (char*)b;
+    for (unsigned k = tid; k < m; k += g) {
+        *(uint4*)(pb + off) = *(const uint4*)(pa + off);
+        off += g_mod;                       // < 2 * nbytes <= 4 GiB: no 32-bit overflow
+        if (off >= nbytes) off -= nbytes;
     }
 }
 
@@ -127,7 +134,7 @@ int main(int argc, char** argv) {
             valid = parse_double(val, &duration) && duration > 0;
         } else if (!strcmp(key, "--working_set_bytes")) {
             seen = &have_ws;
-            valid = parse_ull(val, &ws) && ws >= 32768 && ws <= (1ULL << 36) && ws % (2 * ELEM_BYTES) == 0;
+            valid = parse_ull(val, &ws) && ws >= 32768 && ws <= (1ULL << 32) && ws % (2 * ELEM_BYTES) == 0;
         } else {
             fprintf(stderr, "copy: unknown option %s\n", key);
             return 1;
@@ -158,6 +165,7 @@ int main(int argc, char** argv) {
         const unsigned long long rounds = (g * COPIES_PER_THREAD + n - 1) / n;
         m = rounds * n;
     }
+    if (m + g >= (1ULL << 32)) { fprintf(stderr, "copy: too many copies per launch for 32-bit counters\n"); return 1; }
     fprintf(stderr, "copy: device %s (%s), working_set=%llu B (2 arrays) elements=%llu copies=%llu blocks=%u\n",
             prop.name, pci, ws, n, m, blocks);
 
@@ -171,7 +179,7 @@ int main(int argc, char** argv) {
 
     // Warmup (not part of the ROI)
     hipLaunchKernelGGL(copy_kernel, dim3(blocks), dim3(THREADS), 0, 0,
-                       d_a, d_b, (unsigned long)n, (unsigned long)m);
+                       d_a, d_b, (unsigned)(n * ELEM_BYTES), (unsigned)m);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -183,7 +191,7 @@ int main(int argc, char** argv) {
     double elapsed;
     do {
         hipLaunchKernelGGL(copy_kernel, dim3(blocks), dim3(THREADS), 0, 0,
-                           d_a, d_b, (unsigned long)n, (unsigned long)m);
+                           d_a, d_b, (unsigned)(n * ELEM_BYTES), (unsigned)m);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
         ++launches;
