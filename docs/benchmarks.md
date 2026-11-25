@@ -9,7 +9,7 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [fma](#fma) | 1 | VALU | peak vector throughput per precision |
 | [mfma](#mfma) | 1 | Matrix Cores | peak matrix throughput per precision |
 | [smfma](#smfma) | 1 | Matrix Cores (sparse) | peak sparse matrix throughput per precision |
-| [copy](#copy) | 1 | HBM | bandwidth (read + write) |
+| [copy](#copy) | 1 | L2, LLC, HBM | bandwidth (read + write, same pattern) |
 | [read](#read) | 1 | HBM | read bandwidth |
 | [write](#write) | 1 | L2, LLC, HBM | write bandwidth |
 | [reuse](#reuse) | 1 | L1, L2, LLC | read bandwidth per cache level |
@@ -106,12 +106,34 @@ no scratch, occupancy 8 waves per SIMD). To be confirmed with hipcc on the node.
 
 ## copy
 
-**Kernel.** Copy kernel of STREAM (McCalpin) / BabelStream: one thread per element copies A to
-B (`B[i] = A[i]`, double), no computation. 100 launches per synchronization, so that the launch
-overhead does not dominate for small arrays.
+**Kernel.** Copy kernel as in STREAM (McCalpin) / BabelStream: `B[e] = A[e]`, no computation.
+Since 0.4.0 with 16-byte elements (`uint4`, expected `global_load_dwordx4` / `global_store_dwordx4`),
+the widest access per lane as in all Level 1 memory benchmarks. Same access pattern for read and
+write (sequential), so it is Level 1 (see the Level 1/2 boundary).
+
+**Grid and repetitions.** As in `write`: fixed grid (128 blocks per CU × 256 threads), grid-stride
+loop over the copies of one launch; copy `k` copies element `k mod n`, the position is advanced
+incrementally. `--working_set_bytes` is the size of both arrays together (half each) and selects
+the level: `copy_l2` 2 MiB, `copy_llc` 64 MiB, `copy_hbm` 4 GiB. Up to 64 MiB a launch passes over
+the arrays several times (about 16 copies per thread), otherwise a launch of a few microseconds
+would mostly measure the launch overhead; above, every element is copied once per launch, as in
+STREAM. Within a pass neighbouring lanes copy neighbouring elements (coalesced), also after the
+wrap-around. No L1 run: the L1 is assumed write-through (to be checked, measurement queue item 5).
+
+**Difference to STREAM Copy.** Element type `uint4` instead of `double` (STREAM makes the type
+configurable); the cache-level runs deliberately break the STREAM rule that the arrays must be
+much larger than all caches.
+
+**Bytes.** 16 B read + 16 B written per copy (`a_gbyte`).
+
+**Verification.** A is filled with `value(e)` by a setup kernel, B with zeros; after the timed loop
+every element of B is compared with `value(e)`.
 
 **History.** Named `stream` until 2026-11-10; renamed because it is only the Copy kernel of
-STREAM, not the full benchmark with Copy, Scale, Add and Triad. Behaviour unchanged.
+STREAM, not the full benchmark with Copy, Scale, Add and Triad. 0.4.0 (2026-11-25): `uint4`
+elements, fixed grid with grid-stride loop and repetitions per launch, `--working_set_bytes`
+instead of `--elements`, runs for L2 and LLC, full verification. Up to 0.3.0: one `double` per
+thread, 100 launches per synchronization, HBM only (copy_hbm 3.76 TB/s, 2 GiB).
 
 ## read
 
