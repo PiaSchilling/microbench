@@ -12,13 +12,13 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [copy](#copy) | 1 | L2, LLC, HBM | bandwidth (read + write, same pattern) |
 | [read](#read) | 1 | HBM | read bandwidth |
 | [write](#write) | 1 | L2, LLC, HBM | write bandwidth |
-| [reuse](#reuse) | 1 | L1, L2, LLC | read bandwidth per cache level |
 | [cached_read](#cached_read) | 1 | L1, L2, LLC | read bandwidth per cache level (own kernel, 16-byte loads, no arithmetic) |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
 | [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
 | [scatter](#scatter) | 1 | L1, L2, LLC, HBM | bandwidth of irregular writes (strided, random) |
 | [shared_read](#shared_read) | 1 | LDS | LDS read bandwidth |
 | [shared_read_rocprof_prefill](#shared_read_rocprof_prefill) | test | LDS | test only: LDS_bw after filling the LDS with a pattern |
+| [reuse](#reuse) | ref | L1, L2, LLC | reference only: rocprof-compute cache kernel, for comparison with cached_read |
 | [shared_read_rocprof](#shared_read_rocprof) | ref | LDS | reference only: rocprof-compute LDS kernel, for comparison with shared_read |
 | [gemm](#gemm) | 2 | VALU, LDS, memory | load shifted between memory and compute via K |
 
@@ -174,14 +174,21 @@ Normal stores (not non-temporal), so the memory level is selected by the buffer 
 **Grid and memory level.** Fixed grid as in `read` and `gather`: 128 blocks per CU × 256 threads.
 `--working_set_bytes` selects the level, as in `gather`: buffers up to 64 MiB are written in a whole
 number of rounds per launch (about 16 stores per thread, always the same value per element), larger
-buffers once per launch. No L1 run: the L1 is write-through, stores go on to the L2 (to be confirmed
-with the counters, see the scatter L1 runs). With 2 MiB every XCD writes the whole buffer into its
+buffers once per launch. No L1 run: the L1 is write-through, stores go on to the L2 (confirmed
+2026-11-25: `scatter` L1 runs ≈ L2 runs). With 2 MiB every XCD writes the whole buffer into its
 own L2; the write-back at the end of each launch is small compared with the bytes per launch.
+
+**Addresses (since 0.2.0).** 32-bit byte offsets from the buffer base pointer (helper `at(p, off)`),
+as in `copy` 0.5.0: the compiler uses stores with a scalar base and a 32-bit vector offset instead
+of 64-bit address arithmetic. 0.1.0 had 22 % VALU in `write_l2` without any value computation
+besides `value()`. Inner loop (local clang 18 check, gfx942): 11 → 8 VALU instructions per store
+(`value()` itself needs 2; copy 11 → 6 without a value). Limit: buffer ≤ 2 GiB (`write_hbm` therefore 2 GiB instead of 4 GiB; for `copy`
+2 GiB and 4 GiB gave the same bandwidth).
 
 **Bytes.** Nominal = bytes stored (16 B per store).
 
-**Verification.** Every element holds a value derived from its position (`value(e)`); after the
-timed loop the whole buffer is compared on the host.
+**Verification.** Every element holds a value derived from its byte offset (`value(off)`, since 0.2.0;
+0.1.0: from the element index); after the timed loop the whole buffer is compared on the host.
 
 ## cached_read
 
@@ -216,6 +223,13 @@ the XOR of the 16 words of the last iteration, the host recomputes it; all other
 if their result equals a magic value, so the loop cannot be removed in any block.
 
 ## reuse
+
+*Source in `src/experimental/`, not built by default: move it to `src/` and uncomment its runs in `config/runs.cfg` to run it.*
+
+**Reference only, not part of the coverage analysis** (since 2026-11-26). The runs in `runs.cfg`
+are named `ref_reuse_l1`, `ref_reuse_l2`, `ref_reuse_llc`. `cached_read` reaches the same
+bandwidth on all three levels with VALU ≈ 0 (L1: 260 W less) and replaces it as the Level 1
+benchmark for the cache levels.
 
 **Kernel.** `Cache_bw`, taken unchanged from the roofline benchmark of rocprofiler-compute,
 github.com/ROCm/rocm-systems, branch develop, commit 06cf5fb,

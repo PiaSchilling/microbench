@@ -4,12 +4,12 @@
 // component=GPU/Memory/Bandwidth
 // description=Write-only streaming kernel: every thread stores 16-byte elements in a grid-stride loop, consecutive addresses per wavefront (coalesced), no reads; write bandwidth per memory level
 // tags=memory-bound;bandwidth;write-only
-// version=0.1.0
+// version=0.2.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
-// param.working_set_bytes=4294967296|multiple of 16, >= 16384, <= 68719476736|Size of the written buffer; selects the memory level (L2, LLC, HBM; the L1 is write-through)
+// param.working_set_bytes=2147483648|multiple of 16, >= 16384, <= 2147483648|Size of the written buffer; selects the memory level (L2, LLC, HBM; the L1 is write-through)
 //
 // # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=global_store_dwordx4
@@ -21,6 +21,10 @@
 // Fixed grid (128 blocks per CU); buffers up to 64 MiB are written several times
 // per launch (about 16 stores per thread), larger ones once. The counterpart of
 // read. The L1 is write-through, so the smallest meaningful level is the L2.
+// Addresses are 32-bit byte offsets from the buffer base pointer (since 0.2.0, as
+// copy 0.5.0): the compiler then uses stores with a scalar base and a 32-bit
+// vector offset instead of 64-bit address arithmetic (less VALU load); hence at
+// most 2 GiB.
 // Source: own implementation.
 // Details: docs/benchmarks.md#write
 // Interface: docs/benchmark_contract.md
@@ -50,25 +54,32 @@ static const unsigned long long LLC_BYTES = 64ULL << 20;    // above: every elem
 static const unsigned long long STORES_PER_THREAD = 16;      // for buffers up to LLC_BYTES
 static const unsigned ELEM_BYTES = 16;                       // sizeof(uint4)
 
-// Value of element e (also computed on the host for verification)
-__host__ __device__ inline uint4 value(unsigned long e) {
-    const unsigned lo = (unsigned)e, hi = (unsigned)(e >> 32);
-    return make_uint4(lo, hi, lo ^ 0xA5A5A5A5u, ~lo);
+// Value of the element at byte offset off (also computed on the host for
+// verification); derived from the offset directly, so no shift per store.
+__host__ __device__ inline uint4 value(unsigned off) {
+    return make_uint4(off, 0x5A5A5A5Au, off ^ 0xA5A5A5A5u, ~off);
+}
+
+// Element at byte offset off from the base p. A 32-bit offset lets the compiler
+// use a scalar base address plus a 32-bit vector offset (no 64-bit arithmetic).
+__device__ inline uint4& at(uint4* p, unsigned off) {
+    return *(uint4*)((char*)p + off);
 }
 
 // Grid-stride loop over the stores k = 0 .. m-1 of one launch; store k writes
-// element k mod n. The position (k mod n) is advanced incrementally, so no 64-bit
-// division per store limits the throughput. In the cache runs the same element
-// is written several times per launch, always with the same value.
-__global__ void write_kernel(uint4* buf, unsigned long n, unsigned long m) {
-    const unsigned long tid = (unsigned long)blockIdx.x * blockDim.x + threadIdx.x;
-    const unsigned long g = (unsigned long)gridDim.x * blockDim.x;
-    const unsigned long g_mod = g % n;
-    unsigned long pos = tid % n;
-    for (unsigned long k = tid; k < m; k += g) {
-        buf[pos] = value(pos);
-        pos += g_mod;
-        if (pos >= n) pos -= n;
+// the element at byte offset (k * 16) mod nbytes. The offset is advanced
+// incrementally, so no division per store limits the throughput. In the cache
+// runs the same element is written several times per launch, always with the
+// same value.
+__global__ void write_kernel(uint4* buf, unsigned nbytes, unsigned m) {
+    const unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned g = gridDim.x * blockDim.x;
+    const unsigned g_mod = (unsigned)(((unsigned long long)g * ELEM_BYTES) % nbytes);
+    unsigned off = (unsigned)(((unsigned long long)tid * ELEM_BYTES) % nbytes);
+    for (unsigned k = tid; k < m; k += g) {
+        at(buf, off) = value(off);
+        off += g_mod;                       // off, g_mod < nbytes <= 2 GiB: no 32-bit overflow
+        if (off >= nbytes) off -= nbytes;
     }
 }
 
@@ -103,7 +114,7 @@ static bool parse_ull(const char* s, unsigned long long* out) {
 
 int main(int argc, char** argv) {
     double duration = 0;
-    unsigned long long ws = 4ULL << 30;
+    unsigned long long ws = 2ULL << 30;
     bool check = false, have_duration = false, have_ws = false;
 
     // ---- arguments (contract section 4) ----
@@ -119,7 +130,7 @@ int main(int argc, char** argv) {
             valid = parse_double(val, &duration) && duration > 0;
         } else if (!strcmp(key, "--working_set_bytes")) {
             seen = &have_ws;
-            valid = parse_ull(val, &ws) && ws >= 16384 && ws <= (1ULL << 36) && ws % ELEM_BYTES == 0;
+            valid = parse_ull(val, &ws) && ws >= 16384 && ws <= (1ULL << 31) && ws % ELEM_BYTES == 0;
         } else {
             fprintf(stderr, "write: unknown option %s\n", key);
             return 1;
@@ -160,7 +171,7 @@ int main(int argc, char** argv) {
 
     // Warmup (not part of the ROI)
     hipLaunchKernelGGL(write_kernel, dim3(blocks), dim3(THREADS), 0, 0,
-                       d_buf, (unsigned long)n, (unsigned long)m);
+                       d_buf, (unsigned)ws, (unsigned)m);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
 
@@ -172,7 +183,7 @@ int main(int argc, char** argv) {
     double elapsed;
     do {
         hipLaunchKernelGGL(write_kernel, dim3(blocks), dim3(THREADS), 0, 0,
-                           d_buf, (unsigned long)n, (unsigned long)m);
+                           d_buf, (unsigned)ws, (unsigned)m);
         HIP_CHECK(hipGetLastError());
         HIP_CHECK(hipDeviceSynchronize());
         ++launches;
@@ -181,13 +192,13 @@ int main(int argc, char** argv) {
     } while (elapsed < duration);
     const unix_clock::time_point u1 = unix_clock::now();
 
-    // ---- verification: every element holds value(e) ----
+    // ---- verification: every element holds value(its byte offset) ----
     std::vector<uint4> h_buf(n);
     HIP_CHECK(hipMemcpy(h_buf.data(), d_buf, ws, hipMemcpyDeviceToHost));
     bool ok = true;
     unsigned long long bad = 0;
     for (unsigned long long e = 0; e < n; ++e) {
-        const uint4 v = value(e), h = h_buf[e];
+        const uint4 v = value((unsigned)(e * ELEM_BYTES)), h = h_buf[e];
         if (h.x != v.x || h.y != v.y || h.z != v.z || h.w != v.w) { bad = e; ok = false; break; }
     }
     if (!ok) fprintf(stderr, "write: verification failed at element %llu\n", bad);
