@@ -187,14 +187,20 @@ timed loop the whole buffer is compared on the host.
 
 **Kernel.** Own implementation, read counterpart of `write` and `copy` for the cache levels. All
 blocks read the same buffer of `--working_set_bytes` (a power of two) with 16-byte loads (`uint4`,
-expected `global_load_dwordx4`). Per iteration every thread makes four independent reads at
-constant offsets of a quarter buffer from a start element; within a wavefront the 64 lanes read 64
-consecutive elements (coalesced). The start element moves by one wavefront (1 KiB) per iteration,
-computed with a bit mask instead of a modulo. Addresses are 32-bit byte offsets from four base
-pointers, so the compiler uses loads with a scalar base and a 32-bit vector offset: 2 VALU
-instructions per 4 loads (local clang check). The loaded values only feed an empty `asm volatile`
-statement (as `shared_read --consume asm`): the compiler must perform every read, but no arithmetic
-follows.
+expected `global_load_dwordx4`). Per iteration every thread makes four independent reads, one in
+each quarter of the buffer at the same offset; within a wavefront the 64 lanes read 64 consecutive
+elements (coalesced). Every block sweeps its quarters in steps of one block (256 elements = 4 KiB)
+per iteration, starting at a pseudo-random, 4 KiB-aligned position per block (since 0.2.0), so
+blocks that run at the same time read unrelated parts of the buffer and an element is only re-read
+after a long reuse distance. Addresses are 32-bit byte offsets from four base pointers with a bit
+mask, so the compiler uses loads with a scalar base and a 32-bit vector offset: 2 VALU instructions
+per 4 loads (local clang check). The loaded values only feed an empty `asm volatile` statement (as
+`shared_read --consume asm`): the compiler must perform every read, but no arithmetic follows.
+
+**History.** 0.1.0 (2026-11-25): start element `tid + 64 · iteration`; neighbouring wavefronts
+re-read each other's data one iteration later, so `cached_read_llc` (64 MiB) was served mostly by
+the L2 (20.6 TB/s, L2 68 %, beyond L2 69 %) instead of the Infinity Cache. 0.2.0 (2026-11-26):
+block-wise sweep with pseudo-random start positions.
 
 **Why not `reuse`.** `reuse` (rocprof-compute) computes a modulo index for every 4-byte load and is
 therefore VALU-bound for the L1 (VALU 97 %, L1 axis 34 %; AMD's own comment notes the cost);

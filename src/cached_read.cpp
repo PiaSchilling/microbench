@@ -4,7 +4,7 @@
 // component=GPU/Memory/Bandwidth
 // description=Independent 16-byte reads from a buffer shared by all blocks (global_load_dwordx4), consecutive addresses per wavefront, values only marked as used (no arithmetic); read bandwidth of the cache level the buffer fits in (L1, L2, LLC)
 // tags=memory-bound;bandwidth;read-only;cache
-// version=0.1.0
+// version=0.2.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
@@ -18,14 +18,18 @@
 // ---- end metadata ----
 //
 // cached_read: all blocks read the same buffer of working_set_bytes with 16-byte
-// loads; per iteration every thread makes four independent reads at constant
-// offsets of a quarter buffer from a start element, consecutive lanes read
-// consecutive elements (coalesced), and the start element moves by one wavefront
-// (1 KiB) per iteration (bit mask instead of modulo, buffer size a power of two;
-// 32-bit byte offsets, 2 VALU address instructions per 4 loads).
-// The loaded values only feed an empty inline asm statement, so the reads stay in
-// the loop without arithmetic (same idea as shared_read --consume asm). Reuse of
-// the buffer within a launch keeps it in the cache level it fits in.
+// loads; per iteration every thread makes four independent reads, one in each
+// quarter of the buffer, at the same offset; consecutive lanes read consecutive
+// elements (coalesced). Every block sweeps its quarters in steps of one block
+// (256 elements = 4 KiB) per iteration, starting at a pseudo-random, 4 KiB-aligned
+// position per block, so blocks that run at the same time read unrelated parts of
+// the buffer (since 0.2.0; in 0.1.0 neighbouring waves re-read each other's data
+// one iteration later, and the LLC run was served mostly by the L2). Offsets are
+// 32-bit byte offsets with a bit mask (buffer size a power of two): 2 VALU address
+// instructions per 4 loads. The loaded values only feed an empty inline asm
+// statement, so the reads stay in the loop without arithmetic (as shared_read
+// --consume asm). Reuse of the buffer within a launch keeps it in the cache level
+// it fits in (the L2 is invalidated at kernel boundaries).
 // Read counterpart of write and copy for the cache levels; HBM reads: read.
 // Source: own implementation. Reference for comparison: reuse (rocprof-compute).
 // Details: docs/benchmarks.md#cached_read
@@ -53,7 +57,7 @@
 static const int THREADS = 256;          // threads per block, as in read, write, copy
 static const int BLOCKS_PER_CU = 128;    // fixed grid, as in read, write, copy
 static const int SLICES = 4;             // 16-byte reads per thread and iteration
-static const unsigned SHIFT = 64;        // start element moves by one wavefront per iteration
+static const unsigned STEP_BYTES = THREADS * 16;   // a block moves by one block (4 KiB) per iteration
 static const unsigned ELEM_BYTES = 16;   // sizeof(uint4)
 static const unsigned MAGIC = 0x9E3779B9u;   // value that (almost) never occurs; keeps the loop alive
 
@@ -72,9 +76,14 @@ __global__ void fill_kernel(uint4* buf, unsigned n) {
 // Kernel
 // ---------------------------------------------------------------------------
 
+// Pseudo-random, 4 KiB-aligned start offset of a block (block 0 starts at 0).
+// Masked to the quarter in the kernel.
+__host__ __device__ inline unsigned block_start(unsigned block) {
+    return (block * 2654435761u) & ~(STEP_BYTES - 1);
+}
+
 __global__ void cached_read(const uint4* __restrict__ buf, unsigned quarter, int iters, unsigned* out)
 {
-    const unsigned tid = blockIdx.x * blockDim.x + threadIdx.x;
     // 32-bit byte offsets from four base pointers (one per quarter): the compiler
     // then uses global loads with a scalar base and a 32-bit vector offset, so the
     // address costs 2 VALU instructions per 4 loads instead of 64-bit arithmetic.
@@ -82,15 +91,15 @@ __global__ void cached_read(const uint4* __restrict__ buf, unsigned quarter, int
     const char* p1 = p0 + (size_t)quarter * ELEM_BYTES;
     const char* p2 = p1 + (size_t)quarter * ELEM_BYTES;
     const char* p3 = p2 + (size_t)quarter * ELEM_BYTES;
-    const unsigned mask = (quarter - 1) * ELEM_BYTES;   // quarter = n / 4, a power of two
-    const unsigned off0 = tid * ELEM_BYTES;
+    const unsigned mask = quarter * ELEM_BYTES - 1;      // quarter = n / 4, a power of two
+    const unsigned off0 = block_start(blockIdx.x) + threadIdx.x * ELEM_BYTES;
     uint4 a = make_uint4(0, 0, 0, 0), b = a, c = a, d = a;
 
     #pragma unroll 1
     for (int it = 0; it < iters; ++it) {
-        // start element in [0, quarter): the four reads are at constant offsets of a
-        // quarter buffer from it; a wavefront reads 64 consecutive elements.
-        const unsigned off = (off0 + (unsigned)it * SHIFT * ELEM_BYTES) & mask;
+        // the block reads 256 consecutive elements per quarter and moves on by 4 KiB;
+        // wraps around within the quarter
+        const unsigned off = (off0 + (unsigned)it * STEP_BYTES) & mask;
         a = *(const uint4*)(p0 + off);
         b = *(const uint4*)(p1 + off);
         c = *(const uint4*)(p2 + off);
@@ -114,12 +123,14 @@ __global__ void cached_read(const uint4* __restrict__ buf, unsigned quarter, int
     else if (r == MAGIC) out[THREADS] = r;
 }
 
-// Host reference of r for thread tid (block 0, so tid = threadIdx.x)
-static unsigned reference(unsigned tid, unsigned quarter, int iters) {
-    const unsigned base = (tid + (unsigned)(iters - 1) * SHIFT) & (quarter - 1);
+// Host reference of r for thread t of block 0 (start offset 0)
+static unsigned reference(unsigned t, unsigned quarter, int iters) {
+    const unsigned mask = quarter * ELEM_BYTES - 1;
+    const unsigned off = (block_start(0) + t * ELEM_BYTES + (unsigned)(iters - 1) * STEP_BYTES) & mask;
+    const unsigned e = off / ELEM_BYTES;
     unsigned r = 0;
     for (int s = 0; s < SLICES; ++s) {
-        const uint4 v = value(base + s * quarter);
+        const uint4 v = value(e + s * quarter);
         r ^= v.x ^ v.y ^ v.z ^ v.w;
     }
     return r;
