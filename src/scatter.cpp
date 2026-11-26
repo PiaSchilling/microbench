@@ -1,6 +1,6 @@
 // ---- benchmark metadata ----
 // benchmark=scatter
-// level=1
+// level=2
 // component=GPU/Memory/Bandwidth
 // description=Indirect write t[idx[k]] = value(k) (scatter) of 16-byte elements, independent accesses, no data reads (only the index); random order of the cache lines; bandwidth of irregular writes per memory level
 // tags=memory-bound;bandwidth;irregular;write

@@ -1,6 +1,6 @@
 // ---- benchmark metadata ----
 // benchmark=gather
-// level=1
+// level=2
 // component=GPU/Memory/Bandwidth
 // description=Indirect read t[idx[k]] (gather) of 16-byte elements, independent accesses; random order of the cache lines; rate and bandwidth of irregular reads per memory level
 // tags=memory-bound;bandwidth;irregular

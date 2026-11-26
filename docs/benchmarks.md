@@ -14,8 +14,8 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [write](#write) | 1 | L2, LLC, HBM | write bandwidth |
 | [cached_read](#cached_read) | 1 | L1, L2, LLC | read bandwidth per cache level (own kernel, 16-byte loads, no arithmetic) |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
-| [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (random order) |
-| [scatter](#scatter) | 1 | L1, L2, LLC, HBM | bandwidth of irregular writes (random order) |
+| [gather](#gather) | 2 | L1, L2, LLC, HBM | bandwidth of irregular reads (random order) |
+| [scatter](#scatter) | 2 | L2, LLC, HBM | bandwidth of irregular writes (random order) |
 | [shared_read](#shared_read) | 1 | LDS | LDS read bandwidth |
 | [shared_read_rocprof_prefill](#shared_read_rocprof_prefill) | test | LDS | test only: LDS_bw after filling the LDS with a pattern |
 | [reuse](#reuse) | ref | L1, L2, LLC | reference only: rocprof-compute cache kernel, for comparison with cached_read |
@@ -264,6 +264,12 @@ prefetched. The chain is a random permutation with exactly one cycle through all
 the vector L1 (not the scalar cache).
 
 ## gather
+
+**Level 2 since 2026-11-26.** Rule: Level 1 drives one path with the ideal access to its maximum;
+deliberate deviations from the ideal (irregular order, partial lines, expensive operations,
+conflicts) are Level 2. gather adds no new corner (on L1/L2 it loads the same axes as
+`cached_read`/`copy`, with less useful data) and is the base of the irregular Level 2 family
+(`scatter_add`, `triad_gather`, …). Until then Level 1 (rule of 2026-11-23: widest access per lane).
 
 **Kernel.** Own implementation. The threads read elements of the table `t` at the addresses
 given by an index array, `t[idx[k]]`, and sum them; every thread stores its sum once
