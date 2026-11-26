@@ -14,8 +14,8 @@ benchmarks is described in `docs/benchmark_contract.md`.
 | [write](#write) | 1 | L2, LLC, HBM | write bandwidth |
 | [cached_read](#cached_read) | 1 | L1, L2, LLC | read bandwidth per cache level (own kernel, 16-byte loads, no arithmetic) |
 | [chase](#chase) | 1 | L1, L2, LLC, HBM | load latency per memory level |
-| [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (strided, random) |
-| [scatter](#scatter) | 1 | L1, L2, LLC, HBM | bandwidth of irregular writes (strided, random) |
+| [gather](#gather) | 1 | L1, L2, LLC, HBM | bandwidth of irregular reads (random order) |
+| [scatter](#scatter) | 1 | L1, L2, LLC, HBM | bandwidth of irregular writes (random order) |
 | [shared_read](#shared_read) | 1 | LDS | LDS read bandwidth |
 | [shared_read_rocprof_prefill](#shared_read_rocprof_prefill) | test | LDS | test only: LDS_bw after filling the LDS with a pattern |
 | [reuse](#reuse) | ref | L1, L2, LLC | reference only: rocprof-compute cache kernel, for comparison with cached_read |
@@ -273,9 +273,9 @@ where every access depends on the previous one. Gather/scatter as an access type
 HPCC RandomAccess code has no license).
 
 **Index.** The index visits every `stride`-th element of `t` exactly once (default stride 128 B =
-one access per cache line). `--pattern strided`: the lines in address order. `--pattern random`:
-the same lines in a random permutation (Fisher–Yates, fixed seed), without duplicates. Both
-patterns therefore touch the same lines with the same number of accesses; only the order differs.
+one access per cache line), in a random permutation (Fisher–Yates, fixed seed), without
+duplicates. Until 0.3.0 there was also `--pattern strided` (the same lines in address order);
+removed in 0.4.0, see *Strided order (removed)* below.
 
 **Grid and memory level.** Fixed grid as in `read` and `reuse`: 128 blocks per CU × 256 threads,
 independent of the table size. The threads run a grid-stride loop over the accesses `k` of one
@@ -297,10 +297,10 @@ sums are integer adds (`a_gflop = 0`). Until version 0.2.0: 8-byte `double` elem
 
 **Bytes.** Nominal: 16 B table + 4 B index per access, plus 16 B result per thread and launch.
 The hardware moves whole cache lines; with one access per line (stride 128 B) and a table larger
-than the caches, the bytes moved from HBM are up to 8 times the nominal table bytes, for both
-patterns. The difference between strided and
-random therefore comes from the order (DRAM page locality, prefetching), not from the amount. The counters show the difference (an example for the
-roofline question: nominal intensity and actual traffic diverge). The extra field
+than the caches, the bytes moved from HBM are up to 8 times the nominal table bytes. The
+counters show the difference (an example for the roofline question: nominal intensity and actual
+traffic diverge). With few accesses per launch (large stride on a large table) the result stores
+dominate the nominal bytes; compare such runs by `d_gaccess_per_s`. The extra field
 `d_gaccess_per_s` gives the accesses per second (comparable to GUPS).
 
 **Verification.** The sums of all threads are recomputed on the host (about as many additions as
@@ -313,9 +313,23 @@ executed in the L2). Level 2, from Uwe's loops: combinations and realistic varia
 updates with duplicates and a conflict rate (`random_accumulate` vs. `_fake`, HPCC RandomAccess
 style XOR updates), `random_axpy`, several indirect streams.
 
-**Strided vs. random per level.** Both patterns run for L1, L2, LLC and HBM. Expected: a large
-difference in HBM (DRAM page locality, prefetching), a small one in the caches (at most
-address-translation effects); the runs check this assumption.
+**Strided order (removed in 0.4.0).** Measured 2026-11-25 (0.3.0, stride 128 B): strided and
+random differ by < 5 % on every level, for gather and scatter. Stride sweep 2026-11-26 (gather, L2
+2 MiB and HBM 4 GiB, strided / random):
+
+| stride | L2 [TB/s] | HBM [TB/s] |
+|---|---|---|
+| 16 B | 18.5 / 3.47 | 3.62 / 0.58 |
+| 64 B | 6.57 / 3.40 | 1.14 / 0.58 |
+| 128 B | 3.54 / 3.36 | 0.62 / 0.60 |
+| 256 B | 3.61 / 3.42 | 0.69 / 0.67 |
+| 4096 B | 3.66 / 3.34 | (invalid: 1 M accesses per launch, result stores dominate, 128 MiB of lines fit the Infinity Cache) |
+
+Below 128 B strided accesses share cache lines (factor ≈ accesses per line: 16 B coalesced like
+`read`, 64 B two per line); from 128 B on every access touches its own line in both orders and the
+order does not matter, in the caches and in HBM; 4096 B on the L2 shows no channel or set conflict
+effect. Strided therefore adds no Level 1 point: coalesced it duplicates `read`/`cached_read`,
+partial-line use is an inefficiency (Level 2 candidate, `level2_catalog`).
 
 ## scatter
 
@@ -328,7 +342,7 @@ Uwe Küster's form `a(index(i)) = b(i)` adds a sequential read stream `b`; that 
 patterns and therefore belongs to Level 2 (version 0.2.0 still read `b`, changed 2026-11-23).
 
 **Index, grid, memory level.** Exactly as in `gather`: the index visits every `stride`-th element
-of `t` once, in address order (`strided`) or as a random permutation (`random`, same seed); fixed
+of `t` once, as a random permutation (same seed; strided order removed in 0.4.0, see `gather`); fixed
 grid of 128 blocks per CU × 256 threads; tables up to 64 MiB are written in a whole number of
 rounds per launch (about 16 accesses per thread), larger ones once per launch. In the cache runs
 the same element of `t` is therefore written several times per launch, always with the same value
