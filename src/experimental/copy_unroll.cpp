@@ -4,13 +4,14 @@
 // component=GPU/Memory/Bandwidth
 // description=EXPERIMENT ONLY: copy 0.5.0 with 1, 2 or 4 independent copies per loop iteration (all loads before the stores); does more memory parallelism per wavefront raise copy_hbm? Not a coverage point
 // tags=memory-bound;bandwidth;read-write;experiment
-// version=0.1.0
+// version=0.2.0
 // extra_build_flags=
 //
 // # param.<name>=<default>|<valid values>|<effect>
 // param.duration=required|> 0 (seconds)|Length of the timed loop
 // param.working_set_bytes=4294967296|multiple of 32, >= 32768, <= 4294967296|Size of both arrays together (A and B, half each)
 // param.unroll=1|1, 2, 4|Copies per thread and loop iteration; the loads of one iteration are issued before its stores
+// param.grid=fixed|fixed, full|fixed = 128 blocks per CU (as copy 0.5.0); full = one thread per element and launch (as copy 0.3.0), only for working sets above 64 MiB
 //
 // # Expectations (profile mode). To be confirmed with a disassembly (--save-temps).
 // # expect_isa=global_load_dwordx4;global_store_dwordx4
@@ -23,6 +24,9 @@
 // every wavefront waits for its load before the next one is issued (one load in
 // flight). Question: is copy_hbm (3.47 TB/s) below copy 0.3.0 (3.76 TB/s) because of
 // too little memory parallelism per wavefront? (measure_queue item 11)
+// 0.2.0: --grid full (one thread per element, as copy 0.3.0) to test the second
+// hypothesis: the DRAM access order of the fixed grid (several distant regions
+// active at the same time) instead of one front through memory.
 // Lives in src/experimental/; build and run with --src-dir src/experimental and
 // --config config/runs_experimental.cfg.
 // Source: own implementation (derived from copy).
@@ -133,6 +137,8 @@ int main(int argc, char** argv) {
     double duration = 0;
     unsigned long long ws = 4ULL << 30;
     unsigned long long unroll = 1;
+    bool full_grid = false;
+    bool have_grid = false;
     bool check = false, have_duration = false, have_ws = false, have_unroll = false;
 
     // ---- arguments (contract section 4) ----
@@ -149,6 +155,10 @@ int main(int argc, char** argv) {
         } else if (!strcmp(key, "--working_set_bytes")) {
             seen = &have_ws;
             valid = parse_ull(val, &ws) && ws >= 32768 && ws <= (1ULL << 32) && ws % (2 * ELEM_BYTES) == 0;
+        } else if (!strcmp(key, "--grid")) {
+            seen = &have_grid;
+            valid = !strcmp(val, "fixed") || !strcmp(val, "full");
+            full_grid = !strcmp(val, "full");
         } else if (!strcmp(key, "--unroll")) {
             seen = &have_unroll;
             valid = parse_ull(val, &unroll) && (unroll == 1 || unroll == 2 || unroll == 4);
@@ -172,9 +182,12 @@ int main(int argc, char** argv) {
     char pci[32];
     snprintf(pci, sizeof pci, "%04x:%02x:%02x.0",
              (unsigned)prop.pciDomainID, (unsigned)prop.pciBusID, (unsigned)prop.pciDeviceID);
-    const unsigned blocks = BLOCKS_PER_CU * (unsigned)prop.multiProcessorCount;
-    const unsigned long long g = (unsigned long long)blocks * THREADS;
     const unsigned long long n = ws / (2 * ELEM_BYTES);               // elements per array
+    if (full_grid && ws <= LLC_BYTES) { fprintf(stderr, "copy_unroll: --grid full only for working sets above 64 MiB\n"); return 1; }
+    // fixed: 128 blocks per CU; full: one thread per element (each thread one copy per launch)
+    const unsigned blocks = full_grid ? (unsigned)((n + THREADS - 1) / THREADS)
+                                      : BLOCKS_PER_CU * (unsigned)prop.multiProcessorCount;
+    const unsigned long long g = (unsigned long long)blocks * THREADS;
     // Copies per launch: large working sets every element once; small ones (cache
     // levels) a whole number of rounds, about COPIES_PER_THREAD per thread.
     unsigned long long m = n;
@@ -183,8 +196,8 @@ int main(int argc, char** argv) {
         m = rounds * n;
     }
     if (m + g >= (1ULL << 32)) { fprintf(stderr, "copy_unroll: too many copies per launch for 32-bit counters\n"); return 1; }
-    fprintf(stderr, "copy_unroll: device %s (%s), working_set=%llu B (2 arrays) elements=%llu copies=%llu blocks=%u\n",
-            prop.name, pci, ws, n, m, blocks);
+    fprintf(stderr, "copy_unroll: device %s (%s), working_set=%llu B (2 arrays) elements=%llu copies=%llu blocks=%u grid=%s unroll=%llu\n",
+            prop.name, pci, ws, n, m, blocks, full_grid ? "full" : "fixed", unroll);
 
     uint4 *d_a, *d_b;
     HIP_CHECK(hipMalloc(&d_a, n * ELEM_BYTES));
